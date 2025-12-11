@@ -9,10 +9,125 @@ let accountSwitchTimer = null;
 let currentAccountIndex = 0;
 let accounts = [];
 let accountStartTime = null;
+// Track processed posts to avoid duplicates
+let processedPosts = new Set();
 
 // Random delay to simulate human behavior
 function randomDelay(min, max) {
     return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+// Close popups automatically
+function closePopups() {
+    try {
+        // Try multiple selectors for close button
+        const closeSelectors = [
+            '[aria-label*="Close"]',
+            '[aria-label*="Đóng"]',
+            '[aria-label*="close"]',
+            'div[role="button"][aria-label*="Close"]',
+            'div[role="button"][aria-label*="Đóng"]',
+            'div[aria-label="Close"]',
+            'div[aria-label="Đóng"]',
+            'button[aria-label*="Close"]',
+            'button[aria-label*="Đóng"]',
+            // Facebook specific close buttons
+            'div[role="dialog"] div[role="button"]:last-child',
+            'div[role="dialog"] svg[aria-label*="Close"]',
+            'div[role="dialog"] svg[aria-label*="Đóng"]'
+        ];
+        
+        // Find and click close button in dialogs/popups
+        const dialogs = document.querySelectorAll('div[role="dialog"], div[role="presentation"]');
+        for (const dialog of dialogs) {
+            // Check if dialog is visible
+            if (dialog.offsetParent === null) continue;
+            
+            // Try to find close button within dialog
+            for (const selector of closeSelectors) {
+                try {
+                    const closeBtn = dialog.querySelector(selector);
+                    if (closeBtn && closeBtn.offsetParent !== null) {
+                        closeBtn.click();
+                        sendLog('🔒 Đã đóng popup', 'info');
+                        return true;
+                    }
+                } catch (e) {
+                    continue;
+                }
+            }
+            
+            // Alternative: look for X button (usually in top-right corner)
+            const buttons = dialog.querySelectorAll('div[role="button"], button, span[role="button"]');
+            for (const btn of buttons) {
+                if (btn.offsetParent === null) continue;
+                
+                // Check if button is in top-right area of dialog
+                const rect = btn.getBoundingClientRect();
+                const dialogRect = dialog.getBoundingClientRect();
+                const isTopRight = rect.top < dialogRect.top + 50 && rect.right > dialogRect.right - 50;
+                
+                // Check if it looks like a close button (has X or close icon)
+                const hasCloseIcon = btn.querySelector('svg[aria-label*="Close"], svg[aria-label*="Đóng"], svg path[d*="M"]');
+                const text = (btn.textContent || btn.getAttribute('aria-label') || '').toLowerCase();
+                const isCloseText = text.includes('close') || text.includes('đóng') || text === '×' || text === '✕';
+                
+                if ((isTopRight || hasCloseIcon || isCloseText) && btn.offsetParent !== null) {
+                    try {
+                        btn.click();
+                        sendLog('🔒 Đã đóng popup (X button)', 'info');
+                        return true;
+                    } catch (e) {
+                        continue;
+                    }
+                }
+            }
+        }
+        
+        // Alternative: Click outside to close (press Escape key)
+        try {
+            document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', keyCode: 27, bubbles: true }));
+            document.dispatchEvent(new KeyboardEvent('keyup', { key: 'Escape', keyCode: 27, bubbles: true }));
+            return true;
+        } catch (e) {
+            // Ignore
+        }
+        
+        return false;
+    } catch (error) {
+        // Silently fail - don't log errors for popup closing
+        return false;
+    }
+}
+
+// Monitor and auto-close popups using MutationObserver
+let popupObserver = null;
+
+function startPopupWatcher() {
+    if (popupObserver) return; // Already watching
+    
+    popupObserver = new MutationObserver((mutations) => {
+        // Check for new popups every 500ms
+        setTimeout(() => {
+            if (isRunning) {
+                closePopups();
+            }
+        }, 100);
+    });
+    
+    popupObserver.observe(document.body, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['style', 'class', 'aria-hidden']
+    });
+}
+
+function stopPopupWatcher() {
+    if (popupObserver) {
+        popupObserver.disconnect();
+        popupObserver = null;
+    }
 }
 
 // Scroll page
@@ -24,7 +139,7 @@ function scrollPage() {
     sendLog('📜 Đang lướt trang...', 'info');
 }
 
-// Find and click like button
+// Find and click like button (like hàng loạt)
 function likePost() {
     try {
         // Try multiple selectors for like button
@@ -38,10 +153,30 @@ function likePost() {
         
         // First, try to find in articles (more reliable)
         const articles = document.querySelectorAll('article');
+        let likedCount = 0;
+        const maxLikesPerCall = 3; // Like tối đa 3 bài mỗi lần để tránh spam
+        
         for (const article of articles) {
+            if (likedCount >= maxLikesPerCall) break;
+            
+            // Get article ID to track processed posts
+            const articleId = article.getAttribute('data-pagelet') || 
+                            article.getAttribute('id') || 
+                            Array.from(article.querySelectorAll('a[href*="/posts/"], a[href*="/permalink/"]'))[0]?.href || 
+                            article.textContent.substring(0, 50);
+            
+            // Skip if already processed
+            if (processedPosts.has(articleId + '_like')) continue;
+            
             // Check if already liked
             const alreadyLiked = article.querySelector('[aria-label*="Unlike"], [aria-label*="Bỏ thích"], [aria-label*="Liked"], [aria-label*="Đã thích"]');
-            if (alreadyLiked) continue;
+            if (alreadyLiked) {
+                processedPosts.add(articleId + '_like');
+                continue;
+            }
+            
+            // Scroll article into view
+            article.scrollIntoView({ behavior: 'smooth', block: 'center' });
             
             // Try to find like button
             for (const selector of likeSelectors) {
@@ -49,10 +184,14 @@ function likePost() {
                     const likeButton = article.querySelector(selector);
                     if (likeButton && likeButton.offsetParent !== null) {
                         likeButton.click();
+                        processedPosts.add(articleId + '_like');
                         stats.likeCount++;
+                        likedCount++;
                         updateStats();
-                        sendLog(`❤️ Đã like bài viết (Tổng: ${stats.likeCount})`, 'success');
-                        return true;
+                        sendLog(`❤️ Đã like bài viết ${likedCount} (Tổng: ${stats.likeCount})`, 'success');
+                        // Auto close popup after like
+                        setTimeout(() => closePopups(), 300);
+                        break;
                     }
                 } catch (e) {
                     continue;
@@ -60,7 +199,11 @@ function likePost() {
             }
         }
         
-        // Alternative: find by text content in visible buttons
+        if (likedCount > 0) {
+            return true;
+        }
+        
+        // Alternative: find by text content in visible buttons (fallback)
         const allButtons = Array.from(document.querySelectorAll('div[role="button"], span[role="button"], a[role="button"]'));
         for (const btn of allButtons) {
             if (btn.offsetParent === null) continue; // Skip hidden elements
@@ -70,10 +213,19 @@ function likePost() {
                 !text.includes('unlike') && !text.includes('bỏ thích') &&
                 !text.includes('liked') && !text.includes('đã thích')) {
                 try {
+                    // Find parent article
+                    const article = btn.closest('article');
+                    if (article) {
+                        const articleId = article.getAttribute('data-pagelet') || article.getAttribute('id') || article.textContent.substring(0, 50);
+                        if (processedPosts.has(articleId + '_like')) continue;
+                        processedPosts.add(articleId + '_like');
+                    }
+                    
                     btn.click();
                     stats.likeCount++;
                     updateStats();
                     sendLog(`❤️ Đã like bài viết (Tổng: ${stats.likeCount})`, 'success');
+                    setTimeout(() => closePopups(), 300);
                     return true;
                 } catch (e) {
                     continue;
@@ -81,8 +233,10 @@ function likePost() {
             }
         }
         
-        sendLog('⚠️ Không tìm thấy nút Like', 'warning');
-        return false;
+        if (likedCount === 0) {
+            sendLog('⚠️ Không tìm thấy bài viết mới để like. Có thể cần scroll xuống.', 'warning');
+        }
+        return likedCount > 0;
     } catch (error) {
         sendLog('❌ Lỗi khi like: ' + error.message, 'error');
         return false;
@@ -92,90 +246,279 @@ function likePost() {
 // Comment on post (returns Promise)
 function commentPost(commentText) {
     return new Promise((resolve) => {
-        // Find comment box
-        const commentSelectors = [
-            'div[contenteditable="true"][data-testid*="comment"]',
-            'div[contenteditable="true"][aria-label*="comment"]',
-            'div[contenteditable="true"][aria-label*="bình luận"]',
-            'div[contenteditable="true"][placeholder*="comment"]',
-            'div[contenteditable="true"][placeholder*="bình luận"]',
-            'textarea[placeholder*="comment"]',
-            'textarea[placeholder*="bình luận"]'
-        ];
-        
-        let found = false;
-        
-        for (const selector of commentSelectors) {
-            try {
-                const commentBoxes = document.querySelectorAll(selector);
-                for (const commentBox of commentBoxes) {
-                    if (commentBox && commentBox.offsetParent !== null && !found) {
-                        found = true;
-                        commentBox.focus();
-                        commentBox.click();
-                        
-                        // Wait a bit for the box to be ready
-                        setTimeout(() => {
-                            try {
-                                // Set comment text
-                                if (commentBox.contentEditable === 'true') {
-                                    commentBox.textContent = commentText;
-                                    commentBox.innerText = commentText;
-                                    commentBox.dispatchEvent(new Event('input', { bubbles: true }));
-                                    commentBox.dispatchEvent(new Event('keyup', { bubbles: true }));
-                                } else {
-                                    commentBox.value = commentText;
-                                    commentBox.dispatchEvent(new Event('input', { bubbles: true }));
-                                }
-                                
-                                // Find and click submit button
-                                setTimeout(() => {
-                                    const submitSelectors = [
-                                        'div[aria-label*="Post"]',
-                                        'div[aria-label*="Đăng"]',
-                                        'button[type="submit"]',
-                                        'div[role="button"][aria-label*="Post"]',
-                                        'div[role="button"][aria-label*="Comment"]'
-                                    ];
-                                    
-                                    let submitted = false;
-                                    for (const subSelector of submitSelectors) {
-                                        const submitBtn = commentBox.closest('form')?.querySelector(subSelector) ||
-                                                       commentBox.parentElement?.querySelector(subSelector) ||
-                                                       commentBox.closest('div[role="article"]')?.querySelector(subSelector) ||
-                                                       commentBox.closest('article')?.querySelector(subSelector);
-                                        if (submitBtn && submitBtn.offsetParent !== null && !submitted) {
-                                            submitBtn.click();
-                                            stats.commentCount++;
-                                            updateStats();
-                                            sendLog(`💬 Đã comment: "${commentText.substring(0, 30)}${commentText.length > 30 ? '...' : ''}" (Tổng: ${stats.commentCount})`, 'success');
-                                            submitted = true;
-                                            resolve(true);
-                                            return;
-                                        }
-                                    }
-                                    if (!submitted) {
-                                        sendLog('⚠️ Không tìm thấy nút đăng comment', 'warning');
-                                        resolve(false);
-                                    }
-                                }, 1000);
-                            } catch (e) {
-                                sendLog('❌ Lỗi khi comment: ' + e.message, 'error');
-                                resolve(false);
-                            }
-                        }, 500);
-                        break;
+        try {
+            sendLog(`💬 Đang tìm bài viết để comment: "${commentText.substring(0, 30)}${commentText.length > 30 ? '...' : ''}"`, 'info');
+            
+            // First, try to find articles (similar to like)
+            const articles = document.querySelectorAll('article');
+            let found = false;
+            
+            for (const article of articles) {
+                if (found) break;
+                
+                // Check if article is visible
+                if (article.offsetParent === null) continue;
+                
+                // Get article ID to track processed posts
+                const articleId = article.getAttribute('data-pagelet') || 
+                                article.getAttribute('id') || 
+                                Array.from(article.querySelectorAll('a[href*="/posts/"], a[href*="/permalink/"]'))[0]?.href || 
+                                article.textContent.substring(0, 50);
+                
+                // Skip if already commented
+                if (processedPosts.has(articleId + '_comment')) continue;
+                
+                // Scroll article into view
+                article.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                
+                // Step 1: Try to find and click "Comment" or "Bình luận" button to open comment box
+                const commentButtonSelectors = [
+                    'div[role="button"] span:contains("Comment")',
+                    'div[role="button"] span:contains("Bình luận")',
+                    'div[role="button"]:has(span:contains("Comment"))',
+                    'div[role="button"]:has(span:contains("Bình luận"))',
+                    'span:contains("Comment")',
+                    'span:contains("Bình luận")',
+                    'a[href*="/comment"]',
+                    'div[aria-label*="Comment"]',
+                    'div[aria-label*="Bình luận"]'
+                ];
+                
+                let commentButton = null;
+                const allButtons = article.querySelectorAll('div[role="button"], span[role="button"], a[role="button"], span, div');
+                for (const btn of allButtons) {
+                    if (btn.offsetParent === null) continue;
+                    const text = (btn.textContent || btn.getAttribute('aria-label') || '').toLowerCase();
+                    if ((text.includes('comment') || text.includes('bình luận')) && 
+                        !text.includes('comments') && !text.includes('bình luận')) {
+                        // Check if it's not a count (like "5 comments")
+                        const parentText = (btn.parentElement?.textContent || '').toLowerCase();
+                        if (!parentText.match(/\d+\s*(comment|bình luận)/)) {
+                            commentButton = btn;
+                            break;
+                        }
                     }
                 }
-                if (found) break;
-            } catch (e) {
-                sendLog('❌ Lỗi khi tìm ô comment: ' + e.message, 'error');
-                continue;
+                
+                // If found comment button, click it first
+                if (commentButton) {
+                    sendLog('🔍 Tìm thấy nút Comment, đang click...', 'info');
+                    commentButton.click();
+                    // Wait for comment box to appear, then continue
+                    setTimeout(() => {
+                        processCommentBox(article, articleId);
+                    }, 1000);
+                    return; // Exit early, will continue in setTimeout
+                }
+                
+                // Step 2: Now try to find comment box (if no comment button found)
+                processCommentBox(article, articleId);
             }
-        }
-        
-        if (!found) {
-            sendLog('⚠️ Không tìm thấy ô comment', 'warning');
+            
+            function processCommentBox(article, articleId) {
+                // Step 2: Now try to find comment box
+                const commentSelectors = [
+                    'div[contenteditable="true"][data-testid*="comment"]',
+                    'div[contenteditable="true"][aria-label*="comment"]',
+                    'div[contenteditable="true"][aria-label*="bình luận"]',
+                    'div[contenteditable="true"][placeholder*="comment"]',
+                    'div[contenteditable="true"][placeholder*="bình luận"]',
+                    'div[contenteditable="true"][placeholder*="Write"]',
+                    'div[contenteditable="true"][placeholder*="Viết"]',
+                    'div[contenteditable="true"][placeholder*="What"]',
+                    'div[contenteditable="true"]',
+                    'textarea[placeholder*="comment"]',
+                    'textarea[placeholder*="bình luận"]',
+                    'textarea[placeholder*="Write"]',
+                    'textarea[placeholder*="Viết"]',
+                    'textarea[placeholder*="What"]',
+                    // More generic selectors
+                    'div[contenteditable="true"][spellcheck]',
+                    'div[contenteditable="true"][role="textbox"]',
+                    'div[role="textbox"][contenteditable="true"]'
+                ];
+                
+                let commentBox = null;
+                for (const selector of commentSelectors) {
+                    try {
+                        const boxes = article.querySelectorAll(selector);
+                        for (const box of boxes) {
+                            if (box && box.offsetParent !== null) {
+                                // Check if it's actually a comment box (not something else)
+                                const placeholder = (box.getAttribute('placeholder') || '').toLowerCase();
+                                const ariaLabel = (box.getAttribute('aria-label') || '').toLowerCase();
+                                const parentText = (box.parentElement?.textContent || '').toLowerCase();
+                                
+                                if (placeholder.includes('comment') || placeholder.includes('bình luận') ||
+                                    placeholder.includes('write') || placeholder.includes('viết') ||
+                                    placeholder.includes('what') || placeholder.includes('nói') ||
+                                    ariaLabel.includes('comment') || ariaLabel.includes('bình luận') ||
+                                    parentText.includes('comment') || parentText.includes('bình luận') ||
+                                    selector.includes('contenteditable')) {
+                                    commentBox = box;
+                                    break;
+                                }
+                            }
+                        }
+                        if (commentBox) break;
+                    } catch (e) {
+                        continue;
+                    }
+                }
+                
+                // If still not found, try to find any contenteditable in the article's footer area
+                if (!commentBox) {
+                    const articleFooter = article.querySelector('footer, div[role="contentinfo"], div:has(div[role="button"])');
+                    if (articleFooter) {
+                        const allContentEditables = articleFooter.querySelectorAll('div[contenteditable="true"], textarea');
+                        for (const box of allContentEditables) {
+                            if (box && box.offsetParent !== null) {
+                                commentBox = box;
+                                break;
+                            }
+                        }
+                    }
+                }
+                
+                if (commentBox) {
+                    found = true;
+                    // Mark as processed
+                    processedPosts.add(articleId + '_comment');
+                    sendLog('✅ Tìm thấy ô comment!', 'success');
+                    
+                    // Scroll to comment box
+                    commentBox.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    
+                    // Wait a bit then focus and click
+                    setTimeout(() => {
+                        try {
+                            commentBox.focus();
+                            commentBox.click();
+                            
+                            // Wait for box to be ready
+                            setTimeout(() => {
+                                try {
+                                    // Set comment text
+                                    if (commentBox.contentEditable === 'true') {
+                                        // Clear first
+                                        commentBox.textContent = '';
+                                        commentBox.innerText = '';
+                                        
+                                        // Set new text
+                                        commentBox.textContent = commentText;
+                                        commentBox.innerText = commentText;
+                                        
+                                        // Trigger events
+                                        commentBox.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+                                        commentBox.dispatchEvent(new Event('keyup', { bubbles: true, cancelable: true }));
+                                        commentBox.dispatchEvent(new Event('keydown', { bubbles: true, cancelable: true }));
+                                        
+                                        // Also try to set innerHTML
+                                        setTimeout(() => {
+                                            commentBox.innerHTML = commentText;
+                                            commentBox.dispatchEvent(new Event('input', { bubbles: true }));
+                                        }, 100);
+                                    } else {
+                                        commentBox.value = commentText;
+                                        commentBox.dispatchEvent(new Event('input', { bubbles: true }));
+                                    }
+                                    
+                                    sendLog('📝 Đã nhập text vào ô comment', 'info');
+                                    
+                                    // Find and click submit button
+                                    setTimeout(() => {
+                                        const submitSelectors = [
+                                            'div[aria-label*="Post"]',
+                                            'div[aria-label*="Đăng"]',
+                                            'div[aria-label*="Comment"]',
+                                            'div[aria-label*="Bình luận"]',
+                                            'button[type="submit"]',
+                                            'div[role="button"][aria-label*="Post"]',
+                                            'div[role="button"][aria-label*="Đăng"]',
+                                            'div[role="button"][aria-label*="Comment"]',
+                                            'div[role="button"][aria-label*="Bình luận"]',
+                                            'span[aria-label*="Post"]',
+                                            'span[aria-label*="Đăng"]',
+                                            'div[role="button"]:has(svg)'
+                                        ];
+                                        
+                                        let submitted = false;
+                                        
+                                        // Search within article first
+                                        for (const subSelector of submitSelectors) {
+                                            const submitBtn = article.querySelector(subSelector);
+                                            if (submitBtn && submitBtn.offsetParent !== null && !submitted) {
+                                                const btnText = (submitBtn.textContent || submitBtn.getAttribute('aria-label') || '').toLowerCase();
+                                                if (btnText.includes('post') || btnText.includes('đăng') || 
+                                                    btnText.includes('comment') || btnText.includes('bình luận') ||
+                                                    subSelector.includes('submit')) {
+                                                    submitBtn.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                                                    setTimeout(() => {
+                                                        submitBtn.click();
+                                                        stats.commentCount++;
+                                                        updateStats();
+                                                        sendLog(`💬 Đã comment: "${commentText.substring(0, 30)}${commentText.length > 30 ? '...' : ''}" (Tổng: ${stats.commentCount})`, 'success');
+                                                        setTimeout(() => closePopups(), 500);
+                                                        resolve(true);
+                                                    }, 300);
+                                                    submitted = true;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        
+                                        // Alternative: try to find submit button near comment box
+                                        if (!submitted) {
+                                            const parent = commentBox.closest('form') || commentBox.parentElement?.parentElement;
+                                            if (parent) {
+                                                for (const subSelector of submitSelectors) {
+                                                    const submitBtn = parent.querySelector(subSelector);
+                                                    if (submitBtn && submitBtn.offsetParent !== null && !submitted) {
+                                                        submitBtn.click();
+                                                        stats.commentCount++;
+                                                        updateStats();
+                                                        sendLog(`💬 Đã comment: "${commentText.substring(0, 30)}${commentText.length > 30 ? '...' : ''}" (Tổng: ${stats.commentCount})`, 'success');
+                                                        setTimeout(() => closePopups(), 500);
+                                                        resolve(true);
+                                                        submitted = true;
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        
+                                        // Try Enter key as last resort
+                                        if (!submitted) {
+                                            commentBox.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', keyCode: 13, bubbles: true }));
+                                            setTimeout(() => {
+                                                stats.commentCount++;
+                                                updateStats();
+                                                sendLog(`💬 Đã comment (Enter): "${commentText.substring(0, 30)}${commentText.length > 30 ? '...' : ''}" (Tổng: ${stats.commentCount})`, 'success');
+                                                setTimeout(() => closePopups(), 500);
+                                                resolve(true);
+                                            }, 500);
+                                        }
+                                    }, 1500);
+                                } catch (e) {
+                                    sendLog('❌ Lỗi khi nhập comment: ' + e.message, 'error');
+                                    resolve(false);
+                                }
+                            }, 800);
+                        } catch (e) {
+                            sendLog('❌ Lỗi khi click ô comment: ' + e.message, 'error');
+                            resolve(false);
+                        }
+                    }, 500);
+                    return; // Exit function, found comment box
+                }
+            }
+            
+            if (!found) {
+                sendLog('⚠️ Không tìm thấy ô comment trong các bài viết. Có thể cần scroll xuống để xem thêm bài viết.', 'warning');
+                resolve(false);
+            }
+        } catch (error) {
+            sendLog('❌ Lỗi khi comment: ' + error.message, 'error');
             resolve(false);
         }
     });
@@ -705,34 +1048,53 @@ async function runAutomation(settings) {
     }
     
     try {
-        // Auto scroll
+        // Auto close any popups before actions
+        closePopups();
+        
+        // Auto scroll (scroll trước để load thêm bài viết mới)
         if (settings.autoScroll) {
             scrollPage();
             await new Promise(resolve => setTimeout(resolve, settings.speed * 1000));
         }
         
-        // Auto like
+        let hasAction = false;
+        
+        // Auto like hàng loạt
         if (settings.autoLike) {
             const liked = likePost();
             if (liked) {
+                hasAction = true;
                 actionCount++;
-                await new Promise(resolve => setTimeout(resolve, randomDelay(settings.speed * 1000, (settings.speed + 2) * 1000)));
+                await new Promise(resolve => setTimeout(resolve, randomDelay(settings.speed * 800, (settings.speed + 1) * 1000)));
+                // Close popup again after delay
+                closePopups();
             } else {
-                await new Promise(resolve => setTimeout(resolve, 1000));
+                // Nếu không tìm thấy bài để like, scroll xuống để load thêm
+                if (settings.autoScroll) {
+                    scrollPage();
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                }
             }
         }
         
-        // Auto comment
+        // Auto comment hàng loạt
         if (settings.autoComment && settings.commentList) {
             const comments = settings.commentList.split('\n').filter(c => c.trim());
             if (comments.length > 0) {
                 const randomComment = comments[Math.floor(Math.random() * comments.length)];
                 const commented = await commentPost(randomComment.trim());
                 if (commented) {
+                    hasAction = true;
                     actionCount++;
-                    await new Promise(resolve => setTimeout(resolve, randomDelay(settings.speed * 1500, (settings.speed + 3) * 1500)));
+                    await new Promise(resolve => setTimeout(resolve, randomDelay(settings.speed * 1200, (settings.speed + 2) * 1500)));
+                    // Close popup again after delay
+                    closePopups();
                 } else {
-                    await new Promise(resolve => setTimeout(resolve, 1000));
+                    // Nếu không tìm thấy bài để comment, scroll xuống để load thêm
+                    if (settings.autoScroll) {
+                        scrollPage();
+                        await new Promise(resolve => setTimeout(resolve, 1000));
+                    }
                 }
             }
         }
@@ -743,14 +1105,21 @@ async function runAutomation(settings) {
                 const friendAdded = await searchAndAddFriend(settings.searchKeyword);
                 if (friendAdded) {
                     actionCount++;
+                    hasAction = true;
                 }
                 await new Promise(resolve => setTimeout(resolve, randomDelay(settings.speed * 2000, (settings.speed + 2) * 2000)));
             }
         }
         
+        // Nếu không có action nào, scroll để tìm thêm bài viết
+        if (!hasAction && settings.autoScroll) {
+            scrollPage();
+            await new Promise(resolve => setTimeout(resolve, 1500));
+        }
+        
         // Continue loop
         if (isRunning && !isSwitchingAccount) {
-            const delay = randomDelay(settings.speed * 1000, (settings.speed + 1) * 1000);
+            const delay = randomDelay(settings.speed * 800, (settings.speed + 1) * 1000);
             automationTimeout = setTimeout(() => runAutomation(settings), delay);
         }
     } catch (error) {
@@ -795,6 +1164,7 @@ async function startAutomation(settings) {
     isSwitchingAccount = false;
     actionCount = 0;
     totalAccountCycles = 0; // Reset cycle count
+    processedPosts.clear(); // Clear processed posts tracking
     
     // Parse proxies if proxy is enabled
     if (settings.useProxy && settings.proxyList) {
@@ -868,6 +1238,9 @@ async function startAutomation(settings) {
     sendLog('🚀 Bắt đầu automation...', 'success');
     sendLog(`⚙️ Cấu hình: Scroll=${settings.autoScroll}, Like=${settings.autoLike}, Comment=${settings.autoComment}, Friend=${settings.autoFriend}`, 'info');
     
+    // Start popup watcher to auto-close popups
+    startPopupWatcher();
+    
     // Wait a bit for page to stabilize
     await new Promise(resolve => setTimeout(resolve, 2000));
     runAutomation(settings);
@@ -884,6 +1257,9 @@ function stopAutomation() {
         clearTimeout(automationTimeout);
         automationTimeout = null;
     }
+    
+    // Stop popup watcher
+    stopPopupWatcher();
     
     // Clear proxy when stopping
     chrome.runtime.sendMessage({ type: 'clearProxy' }).catch(() => {});
