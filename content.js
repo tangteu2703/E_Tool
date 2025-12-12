@@ -663,6 +663,34 @@ function searchAndAddFriend(keyword) {
 function loginToFacebook(email, password, forceLogin = false) {
     return new Promise((resolve) => {
         sendLog(`🔐 Đang đăng nhập với: ${email.substring(0, 20)}...`, 'info');
+
+        // Close popups that may block the login form (cookie dialogs, etc.)
+        try { closePopups(true); } catch (_) {}
+
+        // Hard timeout guard (extra safety in case outer caller doesn't wrap)
+        let hardTimeoutId = setTimeout(() => {
+            sendLog('⚠️ Timeout đăng nhập (45s). Có thể Facebook đang checkpoint/2FA/captcha.', 'warning');
+            resolve(false);
+        }, 45000);
+
+        const cleanupAndResolve = (value) => {
+            if (hardTimeoutId) {
+                clearTimeout(hardTimeoutId);
+                hardTimeoutId = null;
+            }
+            resolve(value);
+        };
+
+        const setNativeValue = (element, value) => {
+            try {
+                const proto = Object.getPrototypeOf(element);
+                const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+                if (desc && desc.set) desc.set.call(element, value);
+                else element.value = value;
+            } catch (_) {
+                element.value = value;
+            }
+        };
         
         // Check if already logged in
         const loggedInIndicators = [
@@ -683,7 +711,7 @@ function loginToFacebook(email, password, forceLogin = false) {
         // If already logged in and not forcing login, check if we're on login page
         if (isLoggedIn && !forceLogin && !document.querySelector('input[type="email"], input[name="email"]')) {
             sendLog('✅ Đã đăng nhập sẵn', 'success');
-            resolve(true);
+            cleanupAndResolve(true);
             return;
         }
         
@@ -754,90 +782,112 @@ function loginToFacebook(email, password, forceLogin = false) {
             
             if (!emailInput || !passwordInput) {
                 sendLog('❌ Không tìm thấy form đăng nhập', 'error');
-                resolve(false);
+                cleanupAndResolve(false);
                 return;
             }
             
             try {
                 // Fill email
                 emailInput.focus();
-                emailInput.value = email;
-                emailInput.dispatchEvent(new Event('input', { bubbles: true }));
+                setNativeValue(emailInput, email);
+                emailInput.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, data: email, inputType: 'insertText' }));
                 emailInput.dispatchEvent(new Event('change', { bubbles: true }));
                 
                 // Wait a bit
                 setTimeout(() => {
                     // Fill password
                     passwordInput.focus();
-                    passwordInput.value = password;
-                    passwordInput.dispatchEvent(new Event('input', { bubbles: true }));
+                    setNativeValue(passwordInput, password);
+                    passwordInput.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, data: password, inputType: 'insertText' }));
                     passwordInput.dispatchEvent(new Event('change', { bubbles: true }));
                     
                     // Wait and click login
                     setTimeout(() => {
+                        // Start checker (used for both click and Enter fallback)
+                        const startLoginCheck = () => {
+                            let checkCount = 0;
+                            const maxChecks = 30; // 30 seconds max (1s interval)
+                            const startedAt = Date.now();
+
+                            // Progress log every ~5 seconds
+                            const progressId = setInterval(() => {
+                                const secs = Math.floor((Date.now() - startedAt) / 1000);
+                                if (secs > 0 && secs % 5 === 0) {
+                                    sendLog(`⏳ Đang chờ đăng nhập... (${secs}s)`, 'info');
+                                }
+                            }, 1000);
+
+                            const checkLogin = setInterval(() => {
+                                checkCount++;
+
+                                // Detect checkpoint / captcha / 2FA pages
+                                const href = (window.location.href || '').toLowerCase();
+                                if (href.includes('checkpoint') || href.includes('two_factor') || href.includes('recover') || href.includes('captcha')) {
+                                    clearInterval(checkLogin);
+                                    clearInterval(progressId);
+                                    sendLog('❌ Facebook yêu cầu xác minh (checkpoint/2FA/captcha). Không thể tự động đăng nhập.', 'error');
+                                    cleanupAndResolve(false);
+                                    return;
+                                }
+
+                                let loggedIn = false;
+                                // Check for logged in indicators (and ensure login inputs are gone)
+                                for (const selector of loggedInIndicators) {
+                                    const element = document.querySelector(selector);
+                                    if (element && !document.querySelector('input[type="email"], input[name="email"], input[name="pass"], input[type="password"]')) {
+                                        loggedIn = true;
+                                        break;
+                                    }
+                                }
+
+                                // Check for error messages
+                                const errorElements = document.querySelectorAll('div[role="alert"], .error, [data-testid*="error"], div[id*="error"]');
+                                let hasError = false;
+                                for (const err of errorElements) {
+                                    const text = (err.textContent || '').toLowerCase();
+                                    if (text.includes('incorrect') || text.includes('wrong') || text.includes('sai') || text.includes('không đúng') || text.includes('mật khẩu') || text.includes('password')) {
+                                        hasError = true;
+                                        break;
+                                    }
+                                }
+
+                                if (loggedIn) {
+                                    clearInterval(checkLogin);
+                                    clearInterval(progressId);
+                                    sendLog(`✅ Đăng nhập thành công: ${email}`, 'success');
+                                    chrome.runtime.sendMessage({
+                                        type: 'currentAccount',
+                                        account: email
+                                    }).catch(() => {});
+                                    cleanupAndResolve(true);
+                                } else if (hasError || checkCount >= maxChecks) {
+                                    clearInterval(checkLogin);
+                                    clearInterval(progressId);
+                                    if (hasError) {
+                                        sendLog('❌ Đăng nhập thất bại: Sai email hoặc password / bị Facebook chặn', 'error');
+                                    } else {
+                                        sendLog('⚠️ Timeout đăng nhập (30s)', 'warning');
+                                    }
+                                    cleanupAndResolve(false);
+                                }
+                            }, 1000);
+                        };
+
                         if (loginButton) {
                             loginButton.click();
                             sendLog('⏳ Đang xử lý đăng nhập...', 'info');
-                            
-                            // Wait for login to complete
-                            setTimeout(() => {
-                                // Check if login successful
-                                let checkCount = 0;
-                                const maxChecks = 15; // 15 seconds max
-                                const checkLogin = setInterval(() => {
-                                    checkCount++;
-                                    let loggedIn = false;
-                                    
-                                    // Check for logged in indicators
-                                    for (const selector of loggedInIndicators) {
-                                        const element = document.querySelector(selector);
-                                        if (element && !document.querySelector('input[type="email"], input[name="email"]')) {
-                                            loggedIn = true;
-                                            break;
-                                        }
-                                    }
-                                    
-                                    // Check for error messages
-                                    const errorElements = document.querySelectorAll('div[role="alert"], .error, [data-testid*="error"], div[id*="error"]');
-                                    let hasError = false;
-                                    for (const err of errorElements) {
-                                        const text = (err.textContent || '').toLowerCase();
-                                        if (text.includes('incorrect') || text.includes('wrong') || text.includes('sai') || text.includes('không đúng')) {
-                                            hasError = true;
-                                            break;
-                                        }
-                                    }
-                                    
-                                    if (loggedIn) {
-                                        clearInterval(checkLogin);
-                                        sendLog(`✅ Đăng nhập thành công: ${email}`, 'success');
-                                        chrome.runtime.sendMessage({
-                                            type: 'currentAccount',
-                                            account: email
-                                        }).catch(() => {});
-                                        resolve(true);
-                                    } else if (hasError || checkCount >= maxChecks) {
-                                        clearInterval(checkLogin);
-                                        if (hasError) {
-                                            sendLog('❌ Đăng nhập thất bại: Sai email hoặc password', 'error');
-                                        } else {
-                                            sendLog('⚠️ Timeout đăng nhập', 'warning');
-                                        }
-                                        resolve(false);
-                                    }
-                                }, 1000);
-                            }, 2000);
+                            startLoginCheck();
                         } else {
                             // Try Enter key
                             passwordInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
                             sendLog('⏳ Đang xử lý đăng nhập...', 'info');
-                            setTimeout(() => resolve(true), 3000);
+                            startLoginCheck(); // Verify login instead of resolving true blindly
                         }
                     }, 500);
                 }, 500);
             } catch (error) {
                 sendLog('❌ Lỗi khi đăng nhập: ' + error.message, 'error');
-                resolve(false);
+                cleanupAndResolve(false);
             }
         };
         
