@@ -11,10 +11,24 @@ let accounts = [];
 let accountStartTime = null;
 // Track processed posts to avoid duplicates
 let processedPosts = new Set();
+// Track consecutive times we can't detect feed posts
+let noFeedDetectedCount = 0;
 
 // Random delay to simulate human behavior
 function randomDelay(min, max) {
     return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+// Safe wrapper for chrome.storage.local.set across callback/promise variants
+function safeStorageSet(obj) {
+    try {
+        const result = chrome?.storage?.local?.set?.(obj);
+        if (result && typeof result.catch === 'function') {
+            result.catch(() => {});
+        }
+    } catch (e) {
+        // ignore
+    }
 }
 
 // Close popups automatically
@@ -659,6 +673,43 @@ function searchAndAddFriend(keyword) {
     });
 }
 
+// Check login status
+function checkLoginStatus() {
+    // Check if we're on login page
+    const loginFormVisible = document.querySelector('input[type="email"], input[name="email"]');
+    if (loginFormVisible) {
+        return false; // Not logged in
+    }
+    
+    // Check for logged in indicators
+    const loggedInIndicators = [
+        'input[placeholder*="Search"]',
+        'div[aria-label*="Home"]',
+        'a[href*="/home"]',
+        'div[role="navigation"]',
+        'div[aria-label*="Account"]',
+        'div[data-testid*="account"]'
+    ];
+    
+    for (const selector of loggedInIndicators) {
+        const element = document.querySelector(selector);
+        if (element && element.offsetParent !== null) {
+            // Double check: make sure login form is not visible
+            if (!document.querySelector('input[type="email"], input[name="email"]')) {
+                return true; // Logged in
+            }
+        }
+    }
+    
+    // Check URL
+    const url = window.location.href;
+    if (url.includes('/login') || url.includes('/reg')) {
+        return false; // On login/register page
+    }
+    
+    return false; // Default to not logged in (avoid false positives)
+}
+
 // Login to Facebook
 function loginToFacebook(email, password, forceLogin = false) {
     return new Promise((resolve) => {
@@ -693,23 +744,10 @@ function loginToFacebook(email, password, forceLogin = false) {
         };
         
         // Check if already logged in
-        const loggedInIndicators = [
-            'input[placeholder*="Search"]',
-            'div[aria-label*="Home"]',
-            'a[href*="/home"]',
-            'div[role="navigation"]'
-        ];
-        
-        let isLoggedIn = false;
-        for (const selector of loggedInIndicators) {
-            if (document.querySelector(selector)) {
-                isLoggedIn = true;
-                break;
-            }
-        }
+        const isLoggedIn = checkLoginStatus();
         
         // If already logged in and not forcing login, check if we're on login page
-        if (isLoggedIn && !forceLogin && !document.querySelector('input[type="email"], input[name="email"]')) {
+        if (isLoggedIn && !forceLogin) {
             sendLog('✅ Đã đăng nhập sẵn', 'success');
             cleanupAndResolve(true);
             return;
@@ -897,6 +935,18 @@ function loginToFacebook(email, password, forceLogin = false) {
             chrome.runtime.sendMessage({ type: 'navigate', url: 'https://www.facebook.com/login' });
             // Wait for page to load, then perform login
             setTimeout(performLogin, 3000);
+        } else if (!isLoggedIn) {
+            // Not logged in, navigate to login page first
+            const loginFormVisible = document.querySelector('input[type="email"], input[name="email"]');
+            if (!loginFormVisible) {
+                sendLog('🔄 Chưa đăng nhập, đang chuyển đến trang đăng nhập...', 'info');
+                chrome.runtime.sendMessage({ type: 'navigate', url: 'https://www.facebook.com/login' });
+                // Wait for page to load, then perform login
+                setTimeout(performLogin, 3000);
+            } else {
+                // Already on login page, perform login immediately
+                performLogin();
+            }
         } else {
             // Call immediately
             performLogin();
@@ -1149,6 +1199,9 @@ async function switchToNextAccount(settings, skipIndexIncrement = false) {
             }
         }
         
+        // Persist current index so automation can resume after page reload/navigation
+        safeStorageSet({ currentAccountIndex });
+
         const account = accounts[currentAccountIndex];
         
         sendLog(`🔄 Chuyển sang account ${currentAccountIndex + 1}/${accounts.length}: ${account.email}`, 'info');
@@ -1183,11 +1236,29 @@ async function switchToNextAccount(settings, skipIndexIncrement = false) {
             await new Promise(resolve => setTimeout(resolve, 3000));
         }
         
+        // Verify we're on login page before attempting login
+        const verifyLoginPage = document.querySelector('input[type="email"], input[name="email"]');
+        if (!verifyLoginPage) {
+            sendLog('⚠️ Không thể tìm thấy form đăng nhập, thử lại sau 2 giây...', 'warning');
+            await new Promise(resolve => setTimeout(resolve, 2000));
+        }
+        
         // Login with new account (force login to ensure we login with the new account)
         const loginSuccess = await loginToFacebook(account.email, account.password, true);
         
+        // Verify login was successful
+        if (loginSuccess) {
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            const verifyLoggedIn = checkLoginStatus();
+            if (!verifyLoggedIn) {
+                sendLog('⚠️ Xác thực đăng nhập thất bại sau khi đăng nhập', 'warning');
+                // Continue anyway, might be a timing issue
+            }
+        }
+        
         if (loginSuccess) {
             accountStartTime = Date.now();
+            safeStorageSet({ accountStartTime, currentAccountIndex });
             switchRetryCount = 0; // Reset retry count on successful login
             isSwitchingAccount = false;
             
@@ -1278,6 +1349,13 @@ async function runAutomation(settings) {
         }
         return;
     }
+
+    // If we're not logged in, navigate to login and let auto-resume handle the rest
+    if (!checkLoginStatus()) {
+        sendLog('⚠️ Chưa đăng nhập / bị văng đăng nhập. Đang chuyển tới trang đăng nhập...', 'warning');
+        chrome.runtime.sendMessage({ type: 'navigate', url: 'https://www.facebook.com/login' }).catch(() => {});
+        return;
+    }
     
     // Clear any existing timeout
     if (automationTimeout) {
@@ -1311,6 +1389,20 @@ async function runAutomation(settings) {
     try {
         // Auto close any popups before actions
         closePopups();
+
+        // If we can't detect any feed posts for a while, force navigate to Home
+        const feedCandidates = document.querySelectorAll('article, div[role="article"], div[data-pagelet*="FeedUnit"]');
+        if (feedCandidates.length === 0) {
+            noFeedDetectedCount++;
+            if (noFeedDetectedCount >= 3) {
+                noFeedDetectedCount = 0;
+                sendLog('🔄 Không thấy bài viết (feed). Đang chuyển về Home để tiếp tục...', 'warning');
+                chrome.runtime.sendMessage({ type: 'navigate', url: 'https://www.facebook.com/' }).catch(() => {});
+                return;
+            }
+        } else {
+            noFeedDetectedCount = 0;
+        }
         
         // Auto scroll (scroll trước để load thêm bài viết mới)
         if (settings.autoScroll) {
@@ -1437,6 +1529,10 @@ async function startAutomation(settings) {
     actionCount = 0;
     totalAccountCycles = 0; // Reset cycle count
     processedPosts.clear(); // Clear processed posts tracking
+    noFeedDetectedCount = 0;
+
+    const isResuming = !!settings?.__resume;
+    const resumeIndex = Number.isInteger(settings?.__resumeIndex) ? settings.__resumeIndex : null;
     
     // Parse proxies if proxy is enabled
     if (settings.useProxy && settings.proxyList) {
@@ -1473,74 +1569,153 @@ async function startAutomation(settings) {
                 }
             };
             
-            // Check if already logged in
-            const loggedInIndicators = [
-                'input[placeholder*="Search"]',
-                'div[aria-label*="Home"]',
-                'a[href*="/home"]'
-            ];
-            
-            let alreadyLoggedIn = false;
-            for (const selector of loggedInIndicators) {
-                if (document.querySelector(selector) && !document.querySelector('input[type="email"]')) {
-                    alreadyLoggedIn = true;
-                    break;
-                }
+            // Decide which account index to use (important for resume after navigation/reload)
+            if (isResuming && resumeIndex !== null) {
+                currentAccountIndex = Math.min(Math.max(resumeIndex, 0), accounts.length - 1);
+            } else {
+                currentAccountIndex = 0;
             }
+            safeStorageSet({ currentAccountIndex });
 
+            const alreadyLoggedIn = checkLoginStatus();
             sendLog(`🧭 Trạng thái hiện tại: ${alreadyLoggedIn ? 'Đã đăng nhập' : 'Chưa đăng nhập / đang ở trang login'}`, 'info');
-            
-            // Always start with the first account in the list to avoid index mismatch.
-            // If user is already logged in with some other account, we must logout first.
-            currentAccountIndex = 0;
-            const firstAccount = accounts[0];
-            
-            if (alreadyLoggedIn) {
-                sendLog('🔄 Đang đăng xuất để đăng nhập đúng account đầu tiên...', 'info');
-                try {
-                    await withTimeout(logoutFromFacebook(), 20000, 'logout');
-                } catch (e) {
-                    sendLog(`⚠️ Logout bị chậm/treo: ${e.message}. Thử chuyển thẳng tới trang login...`, 'warning');
+
+            if (isResuming) {
+                // Resume mode: avoid forced logout/login loops. If logged in, just continue.
+                if (alreadyLoggedIn) {
+                    sendLog('🔄 Resume: đã đăng nhập, tiếp tục chạy automation...', 'info');
+                    accountStartTime = Date.now();
+                    safeStorageSet({ accountStartTime });
+                } else {
+                    const targetAccount = accounts[currentAccountIndex];
+
+                    // Ensure we're on login page before trying to login
+                    const loginFormVisible = document.querySelector('input[type="email"], input[name="email"]');
+                    if (!loginFormVisible) {
+                        sendLog('➡️ Resume: đang chuyển tới trang đăng nhập...', 'info');
+                        chrome.runtime.sendMessage({ type: 'navigate', url: 'https://www.facebook.com/login' }).catch(() => {});
+                        await new Promise(resolve => setTimeout(resolve, 3000));
+                    }
+
+                    sendLog(`🔐 Resume: đăng nhập lại account ${currentAccountIndex + 1}/${accounts.length}: ${targetAccount.email}`, 'info');
+                    let loginSuccess = false;
+                    try {
+                        loginSuccess = await withTimeout(
+                            loginToFacebook(targetAccount.email, targetAccount.password, true),
+                            45000,
+                            'login'
+                        );
+                    } catch (e) {
+                        sendLog(`⚠️ Login bị chậm/treo: ${e.message}`, 'warning');
+                        loginSuccess = false;
+                    }
+
+                    if (!loginSuccess) {
+                        sendLog('❌ Resume: không thể đăng nhập (có thể checkpoint/2FA/verify). Dừng automation.', 'error');
+                        stopAutomation();
+                        return;
+                    }
+
+                    accountStartTime = Date.now();
+                    safeStorageSet({ accountStartTime, currentAccountIndex });
                 }
-                await new Promise(resolve => setTimeout(resolve, 3000));
+
+                sendLog(`⏰ Sẽ chuyển account sau ${settings.switchTime} phút`, 'info');
+            } else {
+                // Fresh start: always login with the first account in the list for deterministic behavior
+                currentAccountIndex = 0;
+                safeStorageSet({ currentAccountIndex });
+
+                const firstAccount = accounts[0];
+
+                if (alreadyLoggedIn) {
+                    sendLog('🔄 Đang đăng xuất để đăng nhập đúng account đầu tiên...', 'info');
+                    try {
+                        await withTimeout(logoutFromFacebook(), 20000, 'logout');
+                    } catch (e) {
+                        sendLog(`⚠️ Logout bị chậm/treo: ${e.message}. Thử chuyển thẳng tới trang login...`, 'warning');
+                    }
+                    await new Promise(resolve => setTimeout(resolve, 3000));
+                }
+
+                // Ensure we're on login page before trying to login
+                const loginFormVisible = document.querySelector('input[type="email"], input[name="email"]');
+                if (!loginFormVisible) {
+                    sendLog('➡️ Chưa đăng nhập, đang chuyển tới trang đăng nhập...', 'info');
+                    chrome.runtime.sendMessage({ type: 'navigate', url: 'https://www.facebook.com/login' }).catch(() => {});
+                    await new Promise(resolve => setTimeout(resolve, 3000));
+                }
+
+                sendLog(`🔐 Đăng nhập với account đầu tiên: ${firstAccount.email}`, 'info');
+                let loginSuccess = false;
+                try {
+                    loginSuccess = await withTimeout(
+                        loginToFacebook(firstAccount.email, firstAccount.password, true),
+                        45000,
+                        'login'
+                    );
+                } catch (e) {
+                    sendLog(`⚠️ Login bị chậm/treo: ${e.message}`, 'warning');
+                    loginSuccess = false;
+                }
+
+                if (!loginSuccess) {
+                    sendLog('❌ Không thể đăng nhập với account đầu tiên (có thể FB checkpoint/2FA/verify).', 'error');
+                    stopAutomation();
+                    return;
+                }
+
+                // Verify login was successful before proceeding
+                await new Promise(resolve => setTimeout(resolve, 2000));
+                const verifyLoggedIn = checkLoginStatus();
+                if (!verifyLoggedIn) {
+                    sendLog('❌ Xác thực đăng nhập thất bại, dừng automation', 'error');
+                    stopAutomation();
+                    return;
+                }
+
+                accountStartTime = Date.now();
+                safeStorageSet({ accountStartTime, currentAccountIndex });
+
+                sendLog(`⏰ Sẽ chuyển account sau ${settings.switchTime} phút`, 'info');
             }
-            
-            // Ensure we're on login page before trying to login
-            if (!document.querySelector('input[type="email"], input[name="email"]')) {
-                sendLog('➡️ Chuyển tới trang đăng nhập...', 'info');
-                chrome.runtime.sendMessage({ type: 'navigate', url: 'https://www.facebook.com/login' }).catch(() => {});
-                await new Promise(resolve => setTimeout(resolve, 3000));
-            }
-            
-            sendLog(`🔐 Đăng nhập với account đầu tiên: ${firstAccount.email}`, 'info');
-            let loginSuccess = false;
-            try {
-                loginSuccess = await withTimeout(
-                    loginToFacebook(firstAccount.email, firstAccount.password, true),
-                    45000,
-                    'login'
-                );
-            } catch (e) {
-                sendLog(`⚠️ Login bị chậm/treo: ${e.message}`, 'warning');
-                loginSuccess = false;
-            }
-            
-            if (!loginSuccess) {
-                sendLog('❌ Không thể đăng nhập với account đầu tiên (có thể FB checkpoint/2FA/verify).', 'error');
-                stopAutomation();
-                return;
-            }
-            
-            accountStartTime = Date.now();
-            
-            sendLog(`⏰ Sẽ chuyển account sau ${settings.switchTime} phút`, 'info');
         } else {
             sendLog('⚠️ Không có account nào, chạy với account hiện tại', 'warning');
             accounts = [];
             accountStartTime = Date.now();
         }
     } else {
+        // Single account mode - check if logged in, if not, navigate to login
         accounts = [];
+        const isLoggedIn = checkLoginStatus();
+        
+        if (!isLoggedIn) {
+            sendLog('🔍 Chưa đăng nhập, đang kiểm tra...', 'info');
+            const loginFormVisible = document.querySelector('input[type="email"], input[name="email"]');
+            
+            if (!loginFormVisible) {
+                sendLog('➡️ Chưa đăng nhập, đang chuyển tới trang đăng nhập...', 'info');
+                chrome.runtime.sendMessage({ type: 'navigate', url: 'https://www.facebook.com/login' }).catch(() => {});
+                await new Promise(resolve => setTimeout(resolve, 3000));
+                
+                // After navigating, check again
+                const stillNotLoggedIn = !checkLoginStatus();
+                if (stillNotLoggedIn) {
+                    sendLog('⚠️ Vui lòng đăng nhập thủ công vào Facebook trước khi bắt đầu automation', 'warning');
+                    sendLog('💡 Sau khi đăng nhập, hãy nhấn Start lại', 'info');
+                    stopAutomation();
+                    return;
+                }
+            } else {
+                sendLog('⚠️ Đang ở trang đăng nhập, vui lòng đăng nhập thủ công trước', 'warning');
+                sendLog('💡 Sau khi đăng nhập, hãy nhấn Start lại', 'info');
+                stopAutomation();
+                return;
+            }
+        } else {
+            sendLog('✅ Đã đăng nhập sẵn, tiếp tục với account hiện tại', 'success');
+        }
+        
         accountStartTime = Date.now();
     }
     
@@ -1599,4 +1774,52 @@ chrome.storage.local.get(['likeCount', 'commentCount', 'friendCount'], (result) 
     if (result.commentCount) stats.commentCount = result.commentCount;
     if (result.friendCount) stats.friendCount = result.friendCount;
 });
+
+// Auto-resume after page reload/navigation if user previously started automation
+(async () => {
+    try {
+        if (window.__autoSocialAutomationResumed) return;
+        const stored = await chrome.storage.local.get([
+            'isRunning',
+            'autoScroll', 'autoLike', 'autoComment', 'autoFriend',
+            'commentList', 'searchKeyword', 'speed', 'maxActions',
+            'multiAccount', 'accountList', 'switchTime', 'loopAccounts',
+            'useProxy', 'proxyList', 'preferredCountry', 'rotateProxyPerAccount',
+            'currentAccountIndex'
+        ]);
+
+        if (!stored.isRunning) return;
+
+        window.__autoSocialAutomationResumed = true;
+
+        const settings = {
+            autoScroll: !!stored.autoScroll,
+            autoLike: !!stored.autoLike,
+            autoComment: !!stored.autoComment,
+            autoFriend: !!stored.autoFriend,
+            commentList: stored.commentList || '',
+            searchKeyword: stored.searchKeyword || '',
+            speed: parseInt(stored.speed) || 3,
+            maxActions: parseInt(stored.maxActions) || 10,
+            multiAccount: !!stored.multiAccount,
+            accountList: stored.accountList || '',
+            switchTime: parseInt(stored.switchTime) || 3,
+            loopAccounts: stored.loopAccounts !== undefined ? !!stored.loopAccounts : true,
+            useProxy: !!stored.useProxy,
+            proxyList: stored.proxyList || '',
+            preferredCountry: stored.preferredCountry || '',
+            rotateProxyPerAccount: stored.rotateProxyPerAccount !== undefined ? !!stored.rotateProxyPerAccount : true,
+            __resume: true,
+            __resumeIndex: Number.isInteger(stored.currentAccountIndex) ? stored.currentAccountIndex : 0
+        };
+
+        // Give the page a moment to settle before resuming
+        setTimeout(() => {
+            sendLog('🔄 Trang đã reload, tự động resume automation...', 'info');
+            startAutomation(settings);
+        }, 1200);
+    } catch (e) {
+        // ignore resume errors
+    }
+})();
 
