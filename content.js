@@ -316,205 +316,305 @@ function commentPost(commentText) {
             }
             
             function processCommentBox(article, articleId) {
-                // Step 2: Now try to find comment box
-                const commentSelectors = [
-                    'div[contenteditable="true"][data-testid*="comment"]',
-                    'div[contenteditable="true"][aria-label*="comment"]',
-                    'div[contenteditable="true"][aria-label*="bình luận"]',
-                    'div[contenteditable="true"][placeholder*="comment"]',
-                    'div[contenteditable="true"][placeholder*="bình luận"]',
-                    'div[contenteditable="true"][placeholder*="Write"]',
-                    'div[contenteditable="true"][placeholder*="Viết"]',
-                    'div[contenteditable="true"][placeholder*="What"]',
-                    'div[contenteditable="true"]',
-                    'textarea[placeholder*="comment"]',
-                    'textarea[placeholder*="bình luận"]',
-                    'textarea[placeholder*="Write"]',
-                    'textarea[placeholder*="Viết"]',
-                    'textarea[placeholder*="What"]',
-                    // More generic selectors
-                    'div[contenteditable="true"][spellcheck]',
-                    'div[contenteditable="true"][role="textbox"]',
-                    'div[role="textbox"][contenteditable="true"]'
-                ];
+                // Step 2: Now try to find comment box - try multiple approaches
+                sendLog('🔍 Đang tìm ô comment trong bài viết...', 'info');
                 
-                let commentBox = null;
-                for (const selector of commentSelectors) {
-                    try {
-                        const boxes = article.querySelectorAll(selector);
-                        for (const box of boxes) {
+                // Wait a bit for page to settle after scrolling
+                setTimeout(() => {
+        const commentSelectors = [
+                        // Specific selectors first
+            'div[contenteditable="true"][data-testid*="comment"]',
+            'div[contenteditable="true"][aria-label*="comment"]',
+            'div[contenteditable="true"][aria-label*="bình luận"]',
+            'div[contenteditable="true"][placeholder*="comment"]',
+            'div[contenteditable="true"][placeholder*="bình luận"]',
+                        'div[contenteditable="true"][placeholder*="Write"]',
+                        'div[contenteditable="true"][placeholder*="Viết"]',
+                        'div[contenteditable="true"][placeholder*="What"]',
+                        'div[contenteditable="true"][placeholder*="nói"]',
+            'textarea[placeholder*="comment"]',
+                        'textarea[placeholder*="bình luận"]',
+                        'textarea[placeholder*="Write"]',
+                        'textarea[placeholder*="Viết"]',
+                        'textarea[placeholder*="What"]',
+                        // More generic selectors
+                        'div[contenteditable="true"][spellcheck]',
+                        'div[contenteditable="true"][role="textbox"]',
+                        'div[role="textbox"][contenteditable="true"]',
+                        // Try any contenteditable in article
+                        'div[contenteditable="true"]',
+                        'textarea'
+                    ];
+                    
+                    let commentBox = null;
+                    
+                    // Approach 1: Try specific selectors
+        for (const selector of commentSelectors) {
+            try {
+                            const boxes = article.querySelectorAll(selector);
+                            for (const box of boxes) {
+                                if (box && box.offsetParent !== null) {
+                                    // Check if it's actually a comment box (not something else)
+                                    const placeholder = (box.getAttribute('placeholder') || '').toLowerCase();
+                                    const ariaLabel = (box.getAttribute('aria-label') || '').toLowerCase();
+                                    const dataTestId = (box.getAttribute('data-testid') || '').toLowerCase();
+                                    const parentText = (box.parentElement?.textContent || '').toLowerCase();
+                                    const parentAriaLabel = (box.parentElement?.getAttribute('aria-label') || '').toLowerCase();
+                                    
+                                    // Skip if it's clearly not a comment box
+                                    if (placeholder.includes('search') || placeholder.includes('tìm kiếm') ||
+                                        ariaLabel.includes('search') || ariaLabel.includes('tìm kiếm') ||
+                                        dataTestId.includes('search')) {
+                                        continue;
+                                    }
+                                    
+                                    // Accept if it matches comment box criteria
+                                    if (placeholder.includes('comment') || placeholder.includes('bình luận') ||
+                                        placeholder.includes('write') || placeholder.includes('viết') ||
+                                        placeholder.includes('what') || placeholder.includes('nói') ||
+                                        ariaLabel.includes('comment') || ariaLabel.includes('bình luận') ||
+                                        dataTestId.includes('comment') ||
+                                        parentText.includes('comment') || parentText.includes('bình luận') ||
+                                        parentAriaLabel.includes('comment') || parentAriaLabel.includes('bình luận') ||
+                                        (selector.includes('contenteditable') && !box.textContent.trim())) {
+                                        commentBox = box;
+                                        sendLog('✅ Tìm thấy ô comment bằng selector cụ thể', 'success');
+                                        break;
+                                    }
+                                }
+                            }
+                            if (commentBox) break;
+                        } catch (e) {
+                            continue;
+                        }
+                    }
+                    
+                    // Approach 2: Try to find in article footer/comment section
+                    if (!commentBox) {
+                        sendLog('🔍 Thử tìm trong phần footer/comment section...', 'info');
+                        const articleFooter = article.querySelector('footer, div[role="contentinfo"], div[data-testid*="comment"], div[aria-label*="comment"]');
+                        if (articleFooter) {
+                            const allContentEditables = articleFooter.querySelectorAll('div[contenteditable="true"], textarea');
+                            for (const box of allContentEditables) {
+                                if (box && box.offsetParent !== null) {
+                                    // Check if it's likely a comment box (empty or has placeholder)
+                                    const placeholder = (box.getAttribute('placeholder') || '').toLowerCase();
+                                    const text = box.textContent.trim();
+                                    if (!text || placeholder || box.getAttribute('data-testid')?.includes('comment')) {
+                                        commentBox = box;
+                                        sendLog('✅ Tìm thấy ô comment trong footer', 'success');
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Approach 3: Try to find any empty contenteditable at the bottom of article
+                    if (!commentBox) {
+                        sendLog('🔍 Thử tìm contenteditable trống ở cuối bài viết...', 'info');
+                        const allContentEditables = article.querySelectorAll('div[contenteditable="true"], textarea');
+                        // Get the last few contenteditables (usually comment box is at the bottom)
+                        const lastFew = Array.from(allContentEditables).slice(-3);
+                        for (const box of lastFew) {
                             if (box && box.offsetParent !== null) {
-                                // Check if it's actually a comment box (not something else)
+                                const text = box.textContent.trim();
                                 const placeholder = (box.getAttribute('placeholder') || '').toLowerCase();
-                                const ariaLabel = (box.getAttribute('aria-label') || '').toLowerCase();
-                                const parentText = (box.parentElement?.textContent || '').toLowerCase();
-                                
-                                if (placeholder.includes('comment') || placeholder.includes('bình luận') ||
-                                    placeholder.includes('write') || placeholder.includes('viết') ||
-                                    placeholder.includes('what') || placeholder.includes('nói') ||
-                                    ariaLabel.includes('comment') || ariaLabel.includes('bình luận') ||
-                                    parentText.includes('comment') || parentText.includes('bình luận') ||
-                                    selector.includes('contenteditable')) {
+                                // If it's empty or has a placeholder, it might be a comment box
+                                if ((!text || text.length < 10) && (placeholder || !box.textContent)) {
                                     commentBox = box;
+                                    sendLog('✅ Tìm thấy ô comment ở cuối bài viết', 'success');
                                     break;
                                 }
                             }
                         }
-                        if (commentBox) break;
-                    } catch (e) {
-                        continue;
                     }
-                }
-                
-                // If still not found, try to find any contenteditable in the article's footer area
-                if (!commentBox) {
-                    const articleFooter = article.querySelector('footer, div[role="contentinfo"], div:has(div[role="button"])');
-                    if (articleFooter) {
-                        const allContentEditables = articleFooter.querySelectorAll('div[contenteditable="true"], textarea');
-                        for (const box of allContentEditables) {
-                            if (box && box.offsetParent !== null) {
-                                commentBox = box;
-                                break;
+                    
+                    // Approach 4: Try clicking on "Write a comment" or similar text
+                    if (!commentBox) {
+                        sendLog('🔍 Thử click vào vùng "Write a comment"...', 'info');
+                        const writeCommentTexts = article.querySelectorAll('span, div, a');
+                        for (const elem of writeCommentTexts) {
+                            if (elem.offsetParent === null) continue;
+                            const text = (elem.textContent || '').toLowerCase();
+                            if ((text.includes('write a comment') || text.includes('viết bình luận') ||
+                                 text.includes('add a comment') || text.includes('thêm bình luận') ||
+                                 text === 'comment' || text === 'bình luận') &&
+                                !text.match(/\d+/)) { // Not a count
+                                try {
+                                    elem.click();
+                                    sendLog('🔍 Đã click vào "Write a comment", đợi ô comment xuất hiện...', 'info');
+                                    // Wait for comment box to appear
+                                    setTimeout(() => {
+                                        const newBoxes = article.querySelectorAll('div[contenteditable="true"], textarea');
+                                        for (const box of newBoxes) {
+                                            if (box && box.offsetParent !== null && !box.textContent.trim()) {
+                                                commentBox = box;
+                                                sendLog('✅ Tìm thấy ô comment sau khi click', 'success');
+                                                fillAndSubmitComment(commentBox, article, articleId);
+                                                return;
+                                            }
+                                        }
+                                        sendLog('⚠️ Không tìm thấy ô comment sau khi click', 'warning');
+                                        resolve(false);
+                                    }, 1500);
+                                    return; // Exit early, will continue in setTimeout
+                                } catch (e) {
+                                    continue;
+                                }
                             }
                         }
                     }
-                }
                 
-                if (commentBox) {
-                    found = true;
-                    // Mark as processed
-                    processedPosts.add(articleId + '_comment');
-                    sendLog('✅ Tìm thấy ô comment!', 'success');
+                    // If found comment box, fill and submit
+                    if (commentBox) {
+                        found = true;
+                        fillAndSubmitComment(commentBox, article, articleId);
+                        return; // Exit early
+                    }
                     
-                    // Scroll to comment box
-                    commentBox.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                    
-                    // Wait a bit then focus and click
-                    setTimeout(() => {
-                        try {
-                            commentBox.focus();
-                            commentBox.click();
-                            
-                            // Wait for box to be ready
-                            setTimeout(() => {
-                                try {
-                                    // Set comment text
-                                    if (commentBox.contentEditable === 'true') {
-                                        // Clear first
-                                        commentBox.textContent = '';
-                                        commentBox.innerText = '';
-                                        
-                                        // Set new text
-                                        commentBox.textContent = commentText;
-                                        commentBox.innerText = commentText;
-                                        
-                                        // Trigger events
-                                        commentBox.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
-                                        commentBox.dispatchEvent(new Event('keyup', { bubbles: true, cancelable: true }));
-                                        commentBox.dispatchEvent(new Event('keydown', { bubbles: true, cancelable: true }));
-                                        
-                                        // Also try to set innerHTML
-                                        setTimeout(() => {
-                                            commentBox.innerHTML = commentText;
-                                            commentBox.dispatchEvent(new Event('input', { bubbles: true }));
-                                        }, 100);
-                                    } else {
-                                        commentBox.value = commentText;
-                                        commentBox.dispatchEvent(new Event('input', { bubbles: true }));
-                                    }
-                                    
-                                    sendLog('📝 Đã nhập text vào ô comment', 'info');
-                                    
-                                    // Find and click submit button
-                                    setTimeout(() => {
-                                        const submitSelectors = [
-                                            'div[aria-label*="Post"]',
-                                            'div[aria-label*="Đăng"]',
-                                            'div[aria-label*="Comment"]',
-                                            'div[aria-label*="Bình luận"]',
-                                            'button[type="submit"]',
-                                            'div[role="button"][aria-label*="Post"]',
-                                            'div[role="button"][aria-label*="Đăng"]',
-                                            'div[role="button"][aria-label*="Comment"]',
-                                            'div[role="button"][aria-label*="Bình luận"]',
-                                            'span[aria-label*="Post"]',
-                                            'span[aria-label*="Đăng"]',
-                                            'div[role="button"]:has(svg)'
-                                        ];
-                                        
-                                        let submitted = false;
-                                        
-                                        // Search within article first
-                                        for (const subSelector of submitSelectors) {
-                                            const submitBtn = article.querySelector(subSelector);
-                                            if (submitBtn && submitBtn.offsetParent !== null && !submitted) {
-                                                const btnText = (submitBtn.textContent || submitBtn.getAttribute('aria-label') || '').toLowerCase();
-                                                if (btnText.includes('post') || btnText.includes('đăng') || 
-                                                    btnText.includes('comment') || btnText.includes('bình luận') ||
-                                                    subSelector.includes('submit')) {
-                                                    submitBtn.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                                                    setTimeout(() => {
-                                                        submitBtn.click();
-                                                        stats.commentCount++;
-                                                        updateStats();
-                                                        sendLog(`💬 Đã comment: "${commentText.substring(0, 30)}${commentText.length > 30 ? '...' : ''}" (Tổng: ${stats.commentCount})`, 'success');
-                                                        setTimeout(() => closePopups(), 500);
-                                                        resolve(true);
-                                                    }, 300);
-                                                    submitted = true;
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                        
-                                        // Alternative: try to find submit button near comment box
-                                        if (!submitted) {
-                                            const parent = commentBox.closest('form') || commentBox.parentElement?.parentElement;
-                                            if (parent) {
-                                                for (const subSelector of submitSelectors) {
-                                                    const submitBtn = parent.querySelector(subSelector);
-                                                    if (submitBtn && submitBtn.offsetParent !== null && !submitted) {
-                                                        submitBtn.click();
-                                                        stats.commentCount++;
-                                                        updateStats();
-                                                        sendLog(`💬 Đã comment: "${commentText.substring(0, 30)}${commentText.length > 30 ? '...' : ''}" (Tổng: ${stats.commentCount})`, 'success');
-                                                        setTimeout(() => closePopups(), 500);
-                                                        resolve(true);
-                                                        submitted = true;
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        
-                                        // Try Enter key as last resort
-                                        if (!submitted) {
-                                            commentBox.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', keyCode: 13, bubbles: true }));
-                                            setTimeout(() => {
-                                                stats.commentCount++;
-                                                updateStats();
-                                                sendLog(`💬 Đã comment (Enter): "${commentText.substring(0, 30)}${commentText.length > 30 ? '...' : ''}" (Tổng: ${stats.commentCount})`, 'success');
-                                                setTimeout(() => closePopups(), 500);
-                                                resolve(true);
-                                            }, 500);
-                                        }
-                                    }, 1500);
-                                } catch (e) {
-                                    sendLog('❌ Lỗi khi nhập comment: ' + e.message, 'error');
-                                    resolve(false);
-                                }
-                            }, 800);
-                        } catch (e) {
-                            sendLog('❌ Lỗi khi click ô comment: ' + e.message, 'error');
-                            resolve(false);
-                        }
-                    }, 500);
-                    return; // Exit function, found comment box
-                }
+                    // If still not found after all approaches
+                    if (!found) {
+                        sendLog('⚠️ Không tìm thấy ô comment sau tất cả các cách thử', 'warning');
+                        resolve(false);
+                    }
+                }, 500); // Wait 500ms before searching
             }
             
-            if (!found) {
-                sendLog('⚠️ Không tìm thấy ô comment trong các bài viết. Có thể cần scroll xuống để xem thêm bài viết.', 'warning');
+            // Helper function to fill and submit comment
+            function fillAndSubmitComment(commentBox, article, articleId) {
+                // Mark as processed
+                processedPosts.add(articleId + '_comment');
+                sendLog('✅ Tìm thấy ô comment! Đang điền text...', 'success');
+                
+                // Scroll to comment box
+                commentBox.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                
+                // Wait a bit then focus and click
+                setTimeout(() => {
+                    try {
+                        commentBox.focus();
+                        commentBox.click();
+                        
+                        // Wait for box to be ready
+                        setTimeout(() => {
+                            try {
+                                // Set comment text
+                                if (commentBox.contentEditable === 'true') {
+                                    // Clear first
+                                    commentBox.textContent = '';
+                                    commentBox.innerText = '';
+                                    
+                                    // Set new text
+                                    commentBox.textContent = commentText;
+                                    commentBox.innerText = commentText;
+                                    
+                                    // Trigger events
+                                    commentBox.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+                                    commentBox.dispatchEvent(new Event('keyup', { bubbles: true, cancelable: true }));
+                                    commentBox.dispatchEvent(new Event('keydown', { bubbles: true, cancelable: true }));
+                                    
+                                    // Also try to set innerHTML
+                                    setTimeout(() => {
+                                        commentBox.innerHTML = commentText;
+                                    commentBox.dispatchEvent(new Event('input', { bubbles: true }));
+                                    }, 100);
+                                } else {
+                                    commentBox.value = commentText;
+                                    commentBox.dispatchEvent(new Event('input', { bubbles: true }));
+                                }
+                                
+                                sendLog('📝 Đã nhập text vào ô comment', 'info');
+                                
+                                // Find and click submit button
+                                setTimeout(() => {
+                                    const submitSelectors = [
+                                        'div[aria-label*="Post"]',
+                                        'div[aria-label*="Đăng"]',
+                                        'div[aria-label*="Comment"]',
+                                        'div[aria-label*="Bình luận"]',
+                                        'button[type="submit"]',
+                                        'div[role="button"][aria-label*="Post"]',
+                                        'div[role="button"][aria-label*="Đăng"]',
+                                        'div[role="button"][aria-label*="Comment"]',
+                                        'div[role="button"][aria-label*="Bình luận"]',
+                                        'span[aria-label*="Post"]',
+                                        'span[aria-label*="Đăng"]',
+                                        'div[role="button"]:has(svg)'
+                                    ];
+                                    
+                                    let submitted = false;
+                                    
+                                    // Search within article first
+                                    for (const subSelector of submitSelectors) {
+                                        const submitBtn = article.querySelector(subSelector);
+                                        if (submitBtn && submitBtn.offsetParent !== null && !submitted) {
+                                            const btnText = (submitBtn.textContent || submitBtn.getAttribute('aria-label') || '').toLowerCase();
+                                            if (btnText.includes('post') || btnText.includes('đăng') || 
+                                                btnText.includes('comment') || btnText.includes('bình luận') ||
+                                                subSelector.includes('submit')) {
+                                                submitBtn.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                                                setTimeout(() => {
+                                            submitBtn.click();
+                                            stats.commentCount++;
+                                            updateStats();
+                                            sendLog(`💬 Đã comment: "${commentText.substring(0, 30)}${commentText.length > 30 ? '...' : ''}" (Tổng: ${stats.commentCount})`, 'success');
+                                                    setTimeout(() => closePopups(), 500);
+                                                    resolve(true);
+                                                }, 300);
+                                            submitted = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    
+                                    // Alternative: try to find submit button near comment box
+                                    if (!submitted) {
+                                        const parent = commentBox.closest('form') || commentBox.parentElement?.parentElement;
+                                        if (parent) {
+                                            for (const subSelector of submitSelectors) {
+                                                const submitBtn = parent.querySelector(subSelector);
+                                                if (submitBtn && submitBtn.offsetParent !== null && !submitted) {
+                                                    submitBtn.click();
+                                                    stats.commentCount++;
+                                                    updateStats();
+                                                    sendLog(`💬 Đã comment: "${commentText.substring(0, 30)}${commentText.length > 30 ? '...' : ''}" (Tổng: ${stats.commentCount})`, 'success');
+                                                    setTimeout(() => closePopups(), 500);
+                                            resolve(true);
+                                                    submitted = true;
+                                                    break;
+                                        }
+                                    }
+                                        }
+                                    }
+                                    
+                                    // Try Enter key as last resort
+                                    if (!submitted) {
+                                        commentBox.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', keyCode: 13, bubbles: true }));
+                                        setTimeout(() => {
+                                            stats.commentCount++;
+                                            updateStats();
+                                            sendLog(`💬 Đã comment (Enter): "${commentText.substring(0, 30)}${commentText.length > 30 ? '...' : ''}" (Tổng: ${stats.commentCount})`, 'success');
+                                            setTimeout(() => closePopups(), 500);
+                                            resolve(true);
+                                        }, 500);
+                                    }
+                                }, 1500);
+                            } catch (e) {
+                                sendLog('❌ Lỗi khi nhập comment: ' + e.message, 'error');
+                                        resolve(false);
+                                    }
+                        }, 800);
+                            } catch (e) {
+                        sendLog('❌ Lỗi khi click ô comment: ' + e.message, 'error');
+                                resolve(false);
+                            }
+                        }, 500);
+            }
+            
+            // If no article was processed, resolve false
+        if (!found) {
+                sendLog('⚠️ Không tìm thấy bài viết nào để comment. Có thể cần scroll xuống để xem thêm bài viết.', 'warning');
                 resolve(false);
             }
         } catch (error) {
@@ -1072,7 +1172,7 @@ async function runAutomation(settings) {
                 // Nếu không tìm thấy bài để like, scroll xuống để load thêm
                 if (settings.autoScroll) {
                     scrollPage();
-                    await new Promise(resolve => setTimeout(resolve, 1000));
+                await new Promise(resolve => setTimeout(resolve, 1000));
                 }
             }
         }
@@ -1093,7 +1193,7 @@ async function runAutomation(settings) {
                     // Nếu không tìm thấy bài để comment, scroll xuống để load thêm
                     if (settings.autoScroll) {
                         scrollPage();
-                        await new Promise(resolve => setTimeout(resolve, 1000));
+                    await new Promise(resolve => setTimeout(resolve, 1000));
                     }
                 }
             }
