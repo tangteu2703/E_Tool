@@ -18,8 +18,13 @@ function randomDelay(min, max) {
 }
 
 // Close popups automatically
-function closePopups() {
+function closePopups(silent = false) {
     try {
+        // Don't close popups when switching account (let logout process handle it)
+        if (isSwitchingAccount) {
+            return false;
+        }
+        
         // Try multiple selectors for close button
         const closeSelectors = [
             '[aria-label*="Close"]',
@@ -49,7 +54,9 @@ function closePopups() {
                     const closeBtn = dialog.querySelector(selector);
                     if (closeBtn && closeBtn.offsetParent !== null) {
                         closeBtn.click();
-                        sendLog('🔒 Đã đóng popup', 'info');
+                        if (!silent) {
+                            sendLog('🔒 Đã đóng popup', 'info');
+                        }
                         return true;
                     }
                 } catch (e) {
@@ -75,7 +82,9 @@ function closePopups() {
                 if ((isTopRight || hasCloseIcon || isCloseText) && btn.offsetParent !== null) {
                     try {
                         btn.click();
-                        sendLog('🔒 Đã đóng popup (X button)', 'info');
+                        if (!silent) {
+                            sendLog('🔒 Đã đóng popup (X button)', 'info');
+                        }
                         return true;
                     } catch (e) {
                         continue;
@@ -109,8 +118,9 @@ function startPopupWatcher() {
     popupObserver = new MutationObserver((mutations) => {
         // Check for new popups every 500ms
         setTimeout(() => {
-            if (isRunning) {
-                closePopups();
+            // Don't close popups when switching account or not running
+            if (isRunning && !isSwitchingAccount) {
+                closePopups(true); // Silent mode to reduce log spam
             }
         }, 100);
     });
@@ -139,6 +149,22 @@ function scrollPage() {
     sendLog('📜 Đang lướt trang...', 'info');
 }
 
+// Helper: Check if element is visible in viewport
+function isElementVisible(element) {
+    if (!element || element.offsetParent === null) return false;
+    const rect = element.getBoundingClientRect();
+    const viewportHeight = window.innerHeight || document.documentElement.clientHeight;
+    const viewportWidth = window.innerWidth || document.documentElement.clientWidth;
+    
+    // Check if element is within viewport (with some margin)
+    return (
+        rect.top >= -100 && // Allow some margin above
+        rect.left >= -100 &&
+        rect.bottom <= viewportHeight + 100 && // Allow some margin below
+        rect.right <= viewportWidth + 100
+    );
+}
+
 // Find and click like button (like hàng loạt)
 function likePost() {
     try {
@@ -151,18 +177,35 @@ function likePost() {
             'a[href*="/reactions/picker"]'
         ];
         
-        // First, try to find in articles (more reliable)
-        const articles = document.querySelectorAll('article');
-        let likedCount = 0;
-        const maxLikesPerCall = 3; // Like tối đa 3 bài mỗi lần để tránh spam
+        // Find all articles (including video posts)
+        const allArticles = document.querySelectorAll('article, div[role="article"], div[data-pagelet*="FeedUnit"]');
+        const visibleArticles = [];
         
-        for (const article of articles) {
-            if (likedCount >= maxLikesPerCall) break;
+        // Filter to only visible articles in viewport
+        for (const article of allArticles) {
+            if (isElementVisible(article)) {
+                visibleArticles.push(article);
+            }
+        }
+        
+        if (visibleArticles.length === 0) {
+            sendLog('⚠️ Không tìm thấy bài viết nào trong viewport', 'warning');
+            return false;
+        }
+        
+        let likedCount = 0;
+        const maxLikesPerCall = Math.min(visibleArticles.length, 5); // Like tối đa 5 bài visible cùng lúc
+        
+        sendLog(`🔍 Tìm thấy ${visibleArticles.length} bài viết visible, đang like ${maxLikesPerCall} bài...`, 'info');
+        
+        // Like multiple posts in batch
+        for (let i = 0; i < maxLikesPerCall; i++) {
+            const article = visibleArticles[i];
             
             // Get article ID to track processed posts
             const articleId = article.getAttribute('data-pagelet') || 
                             article.getAttribute('id') || 
-                            Array.from(article.querySelectorAll('a[href*="/posts/"], a[href*="/permalink/"]'))[0]?.href || 
+                            Array.from(article.querySelectorAll('a[href*="/posts/"], a[href*="/permalink/"], a[href*="/videos/"]'))[0]?.href || 
                             article.textContent.substring(0, 50);
             
             // Skip if already processed
@@ -175,46 +218,71 @@ function likePost() {
                 continue;
             }
             
-            // Scroll article into view
-            article.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            
             // Try to find like button
+            let liked = false;
             for (const selector of likeSelectors) {
                 try {
                     const likeButton = article.querySelector(selector);
                     if (likeButton && likeButton.offsetParent !== null) {
-                        likeButton.click();
+                        // Click with small delay between likes
+                        setTimeout(() => {
+                            likeButton.click();
+                        }, i * 200); // Stagger clicks by 200ms
+                        
                         processedPosts.add(articleId + '_like');
                         stats.likeCount++;
                         likedCount++;
-                        updateStats();
-                        sendLog(`❤️ Đã like bài viết ${likedCount} (Tổng: ${stats.likeCount})`, 'success');
-                        // Auto close popup after like
-                        setTimeout(() => closePopups(), 300);
+                        liked = true;
                         break;
                     }
                 } catch (e) {
                     continue;
                 }
             }
+            
+            if (liked) {
+                sendLog(`❤️ Đã like bài viết ${likedCount}/${maxLikesPerCall} (Tổng: ${stats.likeCount})`, 'success');
+            }
         }
         
+        // Update stats after batch
         if (likedCount > 0) {
-            return true;
+            updateStats();
+            // Auto close popups after batch
+            setTimeout(() => closePopups(), 500);
+            
+            // Check if there are more unliked posts in viewport
+            let hasMoreUnliked = false;
+            for (const article of visibleArticles) {
+                const articleId = article.getAttribute('data-pagelet') || 
+                                article.getAttribute('id') || 
+                                Array.from(article.querySelectorAll('a[href*="/posts/"], a[href*="/permalink/"], a[href*="/videos/"]'))[0]?.href || 
+                                article.textContent.substring(0, 50);
+                
+                if (processedPosts.has(articleId + '_like')) continue;
+                
+                const alreadyLiked = article.querySelector('[aria-label*="Unlike"], [aria-label*="Bỏ thích"], [aria-label*="Liked"], [aria-label*="Đã thích"]');
+                if (!alreadyLiked) {
+                    hasMoreUnliked = true;
+                    break;
+                }
+            }
+            
+            // Return object with liked status and hasMore flag
+            return { liked: true, hasMore: hasMoreUnliked };
         }
         
-        // Alternative: find by text content in visible buttons (fallback)
+        // Fallback: find by text content in visible buttons
         const allButtons = Array.from(document.querySelectorAll('div[role="button"], span[role="button"], a[role="button"]'));
         for (const btn of allButtons) {
-            if (btn.offsetParent === null) continue; // Skip hidden elements
+            if (!isElementVisible(btn)) continue;
             
             const text = (btn.textContent || btn.getAttribute('aria-label') || '').toLowerCase();
             if ((text.includes('like') || text.includes('thích')) && 
                 !text.includes('unlike') && !text.includes('bỏ thích') &&
                 !text.includes('liked') && !text.includes('đã thích')) {
                 try {
-                    // Find parent article
-                    const article = btn.closest('article');
+                    const article = btn.closest('article, div[role="article"]');
                     if (article) {
                         const articleId = article.getAttribute('data-pagelet') || article.getAttribute('id') || article.textContent.substring(0, 50);
                         if (processedPosts.has(articleId + '_like')) continue;
@@ -226,7 +294,7 @@ function likePost() {
                     updateStats();
                     sendLog(`❤️ Đã like bài viết (Tổng: ${stats.likeCount})`, 'success');
                     setTimeout(() => closePopups(), 300);
-                    return true;
+                    return { liked: true, hasMore: false };
                 } catch (e) {
                     continue;
                 }
@@ -234,389 +302,288 @@ function likePost() {
         }
         
         if (likedCount === 0) {
-            sendLog('⚠️ Không tìm thấy bài viết mới để like. Có thể cần scroll xuống.', 'warning');
+            sendLog('⚠️ Không tìm thấy bài viết mới để like trong viewport', 'warning');
         }
-        return likedCount > 0;
+        return { liked: false, hasMore: false };
     } catch (error) {
         sendLog('❌ Lỗi khi like: ' + error.message, 'error');
         return false;
     }
 }
 
-// Comment on post (returns Promise)
+// Comment on post (returns Promise) - Batch processing (smarter & more reliable for Facebook)
 function commentPost(commentText) {
-    return new Promise((resolve) => {
-        try {
-            sendLog(`💬 Đang tìm bài viết để comment: "${commentText.substring(0, 30)}${commentText.length > 30 ? '...' : ''}"`, 'info');
-            
-            // First, try to find articles (similar to like)
-            const articles = document.querySelectorAll('article');
-            let found = false;
-            
-            for (const article of articles) {
-                if (found) break;
-                
-                // Check if article is visible
-                if (article.offsetParent === null) continue;
-                
-                // Get article ID to track processed posts
-                const articleId = article.getAttribute('data-pagelet') || 
-                                article.getAttribute('id') || 
-                                Array.from(article.querySelectorAll('a[href*="/posts/"], a[href*="/permalink/"]'))[0]?.href || 
-                                article.textContent.substring(0, 50);
-                
-                // Skip if already commented
-                if (processedPosts.has(articleId + '_comment')) continue;
-                
-                // Scroll article into view
-                article.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                
-                // Step 1: Try to find and click "Comment" or "Bình luận" button to open comment box
-                const commentButtonSelectors = [
-                    'div[role="button"] span:contains("Comment")',
-                    'div[role="button"] span:contains("Bình luận")',
-                    'div[role="button"]:has(span:contains("Comment"))',
-                    'div[role="button"]:has(span:contains("Bình luận"))',
-                    'span:contains("Comment")',
-                    'span:contains("Bình luận")',
-                    'a[href*="/comment"]',
-                    'div[aria-label*="Comment"]',
-                    'div[aria-label*="Bình luận"]'
-                ];
-                
-                let commentButton = null;
-                const allButtons = article.querySelectorAll('div[role="button"], span[role="button"], a[role="button"], span, div');
-                for (const btn of allButtons) {
-                    if (btn.offsetParent === null) continue;
-                    const text = (btn.textContent || btn.getAttribute('aria-label') || '').toLowerCase();
-                    if ((text.includes('comment') || text.includes('bình luận')) && 
-                        !text.includes('comments') && !text.includes('bình luận')) {
-                        // Check if it's not a count (like "5 comments")
-                        const parentText = (btn.parentElement?.textContent || '').toLowerCase();
-                        if (!parentText.match(/\d+\s*(comment|bình luận)/)) {
-                            commentButton = btn;
-                            break;
-                        }
-                    }
-                }
-                
-                // If found comment button, click it first
-                if (commentButton) {
-                    sendLog('🔍 Tìm thấy nút Comment, đang click...', 'info');
-                    commentButton.click();
-                    // Wait for comment box to appear, then continue
-                    setTimeout(() => {
-                        processCommentBox(article, articleId);
-                    }, 1000);
-                    return; // Exit early, will continue in setTimeout
-                }
-                
-                // Step 2: Now try to find comment box (if no comment button found)
-                processCommentBox(article, articleId);
+    const preview = `${commentText.substring(0, 30)}${commentText.length > 30 ? '...' : ''}`;
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+    const getArticleId = (article) => (
+        article.getAttribute('data-pagelet') ||
+        article.getAttribute('id') ||
+        Array.from(article.querySelectorAll('a[href*="/posts/"], a[href*="/permalink/"], a[href*="/videos/"]'))[0]?.href ||
+        article.textContent.substring(0, 50)
+    );
+
+    const isCommentComposer = (el) => {
+        if (!el || el.offsetParent === null) return false;
+        const placeholder = (el.getAttribute('placeholder') || '').toLowerCase();
+        const ariaLabel = (el.getAttribute('aria-label') || '').toLowerCase();
+        const dataTestId = (el.getAttribute('data-testid') || '').toLowerCase();
+
+        // Exclude search
+        if (
+            placeholder.includes('search') || placeholder.includes('tìm kiếm') ||
+            ariaLabel.includes('search') || ariaLabel.includes('tìm kiếm') ||
+            dataTestId.includes('search')
+        ) return false;
+
+        const hay = `${placeholder} ${ariaLabel} ${dataTestId}`;
+        return (
+            hay.includes('write a comment') ||
+            hay.includes('add a comment') ||
+            hay.includes('comment') ||
+            hay.includes('bình luận') ||
+            hay.includes('viết')
+        );
+    };
+
+    const distanceScore = (aRect, bRect) => {
+        // Prefer below-article and close horizontally
+        const dy = Math.max(0, bRect.top - aRect.bottom);
+        const dx = Math.abs((bRect.left + bRect.right) / 2 - (aRect.left + aRect.right) / 2);
+        return dy * 1.0 + dx * 0.5;
+    };
+
+    const findCommentButtonNear = (article) => {
+        const aRect = article.getBoundingClientRect();
+        const candidates = Array.from(document.querySelectorAll('div[role="button"], a[role="button"], button, span[role="button"]'))
+            .filter(el => el && el.offsetParent !== null);
+
+        let best = null;
+        let bestScore = Infinity;
+
+        for (const el of candidates) {
+            const rect = el.getBoundingClientRect();
+            const near =
+                rect.bottom > aRect.top - 100 &&
+                rect.top < aRect.bottom + 600 &&
+                Math.abs(rect.left - aRect.left) < 450;
+            if (!near) continue;
+
+            const text = (el.textContent || '').trim().toLowerCase();
+            const aria = (el.getAttribute('aria-label') || '').trim().toLowerCase();
+            const combined = `${text} ${aria}`;
+
+            // Must look like comment action, not a count
+            const looksLikeComment =
+                combined === 'bình luận' ||
+                combined === 'comment' ||
+                combined.includes('bình luận') ||
+                combined.includes('comment');
+
+            if (!looksLikeComment) continue;
+            if (/\d+/.test(text) && (text.includes('bình luận') || text.includes('comment'))) continue;
+
+            const s = distanceScore(aRect, rect);
+            if (s < bestScore) {
+                best = el;
+                bestScore = s;
             }
-            
-            function processCommentBox(article, articleId) {
-                // Step 2: Now try to find comment box - try multiple approaches
-                sendLog('🔍 Đang tìm ô comment trong bài viết...', 'info');
-                
-                // Wait a bit for page to settle after scrolling
-                setTimeout(() => {
-        const commentSelectors = [
-                        // Specific selectors first
-            'div[contenteditable="true"][data-testid*="comment"]',
-            'div[contenteditable="true"][aria-label*="comment"]',
-            'div[contenteditable="true"][aria-label*="bình luận"]',
-            'div[contenteditable="true"][placeholder*="comment"]',
-            'div[contenteditable="true"][placeholder*="bình luận"]',
-                        'div[contenteditable="true"][placeholder*="Write"]',
-                        'div[contenteditable="true"][placeholder*="Viết"]',
-                        'div[contenteditable="true"][placeholder*="What"]',
-                        'div[contenteditable="true"][placeholder*="nói"]',
-            'textarea[placeholder*="comment"]',
-                        'textarea[placeholder*="bình luận"]',
-                        'textarea[placeholder*="Write"]',
-                        'textarea[placeholder*="Viết"]',
-                        'textarea[placeholder*="What"]',
-                        // More generic selectors
-                        'div[contenteditable="true"][spellcheck]',
-                        'div[contenteditable="true"][role="textbox"]',
-                        'div[role="textbox"][contenteditable="true"]',
-                        // Try any contenteditable in article
-                        'div[contenteditable="true"]',
-                        'textarea'
-                    ];
-                    
-                    let commentBox = null;
-                    
-                    // Approach 1: Try specific selectors
-        for (const selector of commentSelectors) {
+        }
+        return best;
+    };
+
+    const findComposerForArticle = (article) => {
+        const aRect = article.getBoundingClientRect();
+
+        // 1) Search inside article
+        const inArticle = Array.from(article.querySelectorAll('div[contenteditable="true"], textarea, div[role="textbox"][contenteditable="true"]'))
+            .filter(isCommentComposer);
+        if (inArticle.length > 0) return inArticle[0];
+
+        // 2) Search near article in document
+        const all = Array.from(document.querySelectorAll('div[contenteditable="true"], textarea, div[role="textbox"][contenteditable="true"]'))
+            .filter(isCommentComposer);
+
+        let best = null;
+        let bestScore = Infinity;
+        for (const el of all) {
+            const rect = el.getBoundingClientRect();
+            const near =
+                rect.top > aRect.top - 100 &&
+                rect.top < aRect.bottom + 1200 &&
+                Math.abs(rect.left - aRect.left) < 500;
+            if (!near) continue;
+            const s = distanceScore(aRect, rect);
+            if (s < bestScore) {
+                best = el;
+                bestScore = s;
+            }
+        }
+        return best;
+    };
+
+    const setNativeValue = (element, value) => {
+        const { set } = Object.getOwnPropertyDescriptor(element.__proto__, 'value') || {};
+        if (set) set.call(element, value);
+        else element.value = value;
+    };
+
+    const typeInto = (el, text) => {
+        el.focus();
+        try { el.click(); } catch (_) {}
+
+        if (el.isContentEditable || el.getAttribute('contenteditable') === 'true') {
+            // Prefer execCommand so FB/React detects input
             try {
-                            const boxes = article.querySelectorAll(selector);
-                            for (const box of boxes) {
-                                if (box && box.offsetParent !== null) {
-                                    // Check if it's actually a comment box (not something else)
-                                    const placeholder = (box.getAttribute('placeholder') || '').toLowerCase();
-                                    const ariaLabel = (box.getAttribute('aria-label') || '').toLowerCase();
-                                    const dataTestId = (box.getAttribute('data-testid') || '').toLowerCase();
-                                    const parentText = (box.parentElement?.textContent || '').toLowerCase();
-                                    const parentAriaLabel = (box.parentElement?.getAttribute('aria-label') || '').toLowerCase();
-                                    
-                                    // Skip if it's clearly not a comment box
-                                    if (placeholder.includes('search') || placeholder.includes('tìm kiếm') ||
-                                        ariaLabel.includes('search') || ariaLabel.includes('tìm kiếm') ||
-                                        dataTestId.includes('search')) {
-                                        continue;
-                                    }
-                                    
-                                    // Accept if it matches comment box criteria
-                                    if (placeholder.includes('comment') || placeholder.includes('bình luận') ||
-                                        placeholder.includes('write') || placeholder.includes('viết') ||
-                                        placeholder.includes('what') || placeholder.includes('nói') ||
-                                        ariaLabel.includes('comment') || ariaLabel.includes('bình luận') ||
-                                        dataTestId.includes('comment') ||
-                                        parentText.includes('comment') || parentText.includes('bình luận') ||
-                                        parentAriaLabel.includes('comment') || parentAriaLabel.includes('bình luận') ||
-                                        (selector.includes('contenteditable') && !box.textContent.trim())) {
-                                        commentBox = box;
-                                        sendLog('✅ Tìm thấy ô comment bằng selector cụ thể', 'success');
-                                        break;
-                                    }
-                                }
-                            }
-                            if (commentBox) break;
-                        } catch (e) {
-                            continue;
-                        }
-                    }
-                    
-                    // Approach 2: Try to find in article footer/comment section
-                    if (!commentBox) {
-                        sendLog('🔍 Thử tìm trong phần footer/comment section...', 'info');
-                        const articleFooter = article.querySelector('footer, div[role="contentinfo"], div[data-testid*="comment"], div[aria-label*="comment"]');
-                        if (articleFooter) {
-                            const allContentEditables = articleFooter.querySelectorAll('div[contenteditable="true"], textarea');
-                            for (const box of allContentEditables) {
-                                if (box && box.offsetParent !== null) {
-                                    // Check if it's likely a comment box (empty or has placeholder)
-                                    const placeholder = (box.getAttribute('placeholder') || '').toLowerCase();
-                                    const text = box.textContent.trim();
-                                    if (!text || placeholder || box.getAttribute('data-testid')?.includes('comment')) {
-                                        commentBox = box;
-                                        sendLog('✅ Tìm thấy ô comment trong footer', 'success');
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    
-                    // Approach 3: Try to find any empty contenteditable at the bottom of article
-                    if (!commentBox) {
-                        sendLog('🔍 Thử tìm contenteditable trống ở cuối bài viết...', 'info');
-                        const allContentEditables = article.querySelectorAll('div[contenteditable="true"], textarea');
-                        // Get the last few contenteditables (usually comment box is at the bottom)
-                        const lastFew = Array.from(allContentEditables).slice(-3);
-                        for (const box of lastFew) {
-                            if (box && box.offsetParent !== null) {
-                                const text = box.textContent.trim();
-                                const placeholder = (box.getAttribute('placeholder') || '').toLowerCase();
-                                // If it's empty or has a placeholder, it might be a comment box
-                                if ((!text || text.length < 10) && (placeholder || !box.textContent)) {
-                                    commentBox = box;
-                                    sendLog('✅ Tìm thấy ô comment ở cuối bài viết', 'success');
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    
-                    // Approach 4: Try clicking on "Write a comment" or similar text
-                    if (!commentBox) {
-                        sendLog('🔍 Thử click vào vùng "Write a comment"...', 'info');
-                        const writeCommentTexts = article.querySelectorAll('span, div, a');
-                        for (const elem of writeCommentTexts) {
-                            if (elem.offsetParent === null) continue;
-                            const text = (elem.textContent || '').toLowerCase();
-                            if ((text.includes('write a comment') || text.includes('viết bình luận') ||
-                                 text.includes('add a comment') || text.includes('thêm bình luận') ||
-                                 text === 'comment' || text === 'bình luận') &&
-                                !text.match(/\d+/)) { // Not a count
-                                try {
-                                    elem.click();
-                                    sendLog('🔍 Đã click vào "Write a comment", đợi ô comment xuất hiện...', 'info');
-                                    // Wait for comment box to appear
-                                    setTimeout(() => {
-                                        const newBoxes = article.querySelectorAll('div[contenteditable="true"], textarea');
-                                        for (const box of newBoxes) {
-                                            if (box && box.offsetParent !== null && !box.textContent.trim()) {
-                                                commentBox = box;
-                                                sendLog('✅ Tìm thấy ô comment sau khi click', 'success');
-                                                fillAndSubmitComment(commentBox, article, articleId);
-                                                return;
-                                            }
-                                        }
-                                        sendLog('⚠️ Không tìm thấy ô comment sau khi click', 'warning');
-                                        resolve(false);
-                                    }, 1500);
-                                    return; // Exit early, will continue in setTimeout
-                                } catch (e) {
-                                    continue;
-                                }
-                            }
-                        }
-                    }
-                
-                    // If found comment box, fill and submit
-                    if (commentBox) {
-                        found = true;
-                        fillAndSubmitComment(commentBox, article, articleId);
-                        return; // Exit early
-                    }
-                    
-                    // If still not found after all approaches
-                    if (!found) {
-                        sendLog('⚠️ Không tìm thấy ô comment sau tất cả các cách thử', 'warning');
-                        resolve(false);
-                    }
-                }, 500); // Wait 500ms before searching
+                document.execCommand('selectAll', false, null);
+                document.execCommand('insertText', false, text);
+            } catch (_) {
+                el.textContent = text;
             }
-            
-            // Helper function to fill and submit comment
-            function fillAndSubmitComment(commentBox, article, articleId) {
-                // Mark as processed
-                processedPosts.add(articleId + '_comment');
-                sendLog('✅ Tìm thấy ô comment! Đang điền text...', 'success');
-                
-                // Scroll to comment box
-                commentBox.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                
-                // Wait a bit then focus and click
-                setTimeout(() => {
-                    try {
-                        commentBox.focus();
-                        commentBox.click();
-                        
-                        // Wait for box to be ready
-                        setTimeout(() => {
-                            try {
-                                // Set comment text
-                                if (commentBox.contentEditable === 'true') {
-                                    // Clear first
-                                    commentBox.textContent = '';
-                                    commentBox.innerText = '';
-                                    
-                                    // Set new text
-                                    commentBox.textContent = commentText;
-                                    commentBox.innerText = commentText;
-                                    
-                                    // Trigger events
-                                    commentBox.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
-                                    commentBox.dispatchEvent(new Event('keyup', { bubbles: true, cancelable: true }));
-                                    commentBox.dispatchEvent(new Event('keydown', { bubbles: true, cancelable: true }));
-                                    
-                                    // Also try to set innerHTML
-                                    setTimeout(() => {
-                                        commentBox.innerHTML = commentText;
-                                    commentBox.dispatchEvent(new Event('input', { bubbles: true }));
-                                    }, 100);
-                                } else {
-                                    commentBox.value = commentText;
-                                    commentBox.dispatchEvent(new Event('input', { bubbles: true }));
-                                }
-                                
-                                sendLog('📝 Đã nhập text vào ô comment', 'info');
-                                
-                                // Find and click submit button
-                                setTimeout(() => {
-                                    const submitSelectors = [
-                                        'div[aria-label*="Post"]',
-                                        'div[aria-label*="Đăng"]',
-                                        'div[aria-label*="Comment"]',
-                                        'div[aria-label*="Bình luận"]',
-                                        'button[type="submit"]',
-                                        'div[role="button"][aria-label*="Post"]',
-                                        'div[role="button"][aria-label*="Đăng"]',
-                                        'div[role="button"][aria-label*="Comment"]',
-                                        'div[role="button"][aria-label*="Bình luận"]',
-                                        'span[aria-label*="Post"]',
-                                        'span[aria-label*="Đăng"]',
-                                        'div[role="button"]:has(svg)'
-                                    ];
-                                    
-                                    let submitted = false;
-                                    
-                                    // Search within article first
-                                    for (const subSelector of submitSelectors) {
-                                        const submitBtn = article.querySelector(subSelector);
-                                        if (submitBtn && submitBtn.offsetParent !== null && !submitted) {
-                                            const btnText = (submitBtn.textContent || submitBtn.getAttribute('aria-label') || '').toLowerCase();
-                                            if (btnText.includes('post') || btnText.includes('đăng') || 
-                                                btnText.includes('comment') || btnText.includes('bình luận') ||
-                                                subSelector.includes('submit')) {
-                                                submitBtn.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                                                setTimeout(() => {
-                                            submitBtn.click();
-                                            stats.commentCount++;
-                                            updateStats();
-                                            sendLog(`💬 Đã comment: "${commentText.substring(0, 30)}${commentText.length > 30 ? '...' : ''}" (Tổng: ${stats.commentCount})`, 'success');
-                                                    setTimeout(() => closePopups(), 500);
-                                                    resolve(true);
-                                                }, 300);
-                                            submitted = true;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    
-                                    // Alternative: try to find submit button near comment box
-                                    if (!submitted) {
-                                        const parent = commentBox.closest('form') || commentBox.parentElement?.parentElement;
-                                        if (parent) {
-                                            for (const subSelector of submitSelectors) {
-                                                const submitBtn = parent.querySelector(subSelector);
-                                                if (submitBtn && submitBtn.offsetParent !== null && !submitted) {
-                                                    submitBtn.click();
-                                                    stats.commentCount++;
-                                                    updateStats();
-                                                    sendLog(`💬 Đã comment: "${commentText.substring(0, 30)}${commentText.length > 30 ? '...' : ''}" (Tổng: ${stats.commentCount})`, 'success');
-                                                    setTimeout(() => closePopups(), 500);
-                                            resolve(true);
-                                                    submitted = true;
-                                                    break;
-                                        }
-                                    }
-                                        }
-                                    }
-                                    
-                                    // Try Enter key as last resort
-                                    if (!submitted) {
-                                        commentBox.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', keyCode: 13, bubbles: true }));
-                                        setTimeout(() => {
-                                            stats.commentCount++;
-                                            updateStats();
-                                            sendLog(`💬 Đã comment (Enter): "${commentText.substring(0, 30)}${commentText.length > 30 ? '...' : ''}" (Tổng: ${stats.commentCount})`, 'success');
-                                            setTimeout(() => closePopups(), 500);
-                                            resolve(true);
-                                        }, 500);
-                                    }
-                                }, 1500);
-                            } catch (e) {
-                                sendLog('❌ Lỗi khi nhập comment: ' + e.message, 'error');
-                                        resolve(false);
-                                    }
-                        }, 800);
-                            } catch (e) {
-                        sendLog('❌ Lỗi khi click ô comment: ' + e.message, 'error');
-                                resolve(false);
-                            }
-                        }, 500);
+            el.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, data: text, inputType: 'insertText' }));
+        } else {
+            setNativeValue(el, text);
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+    };
+
+    const findSubmitButton = (composer, article) => {
+        const cRect = composer.getBoundingClientRect();
+        const root = composer.closest('form') || composer.closest('[role="dialog"]') || article;
+        const candidates = Array.from(root.querySelectorAll('div[role="button"], button, a[role="button"], span[role="button"]'))
+            .filter(el => el && el.offsetParent !== null);
+
+        const keywords = ['đăng', 'post', 'send', 'gửi', 'bình luận', 'comment'];
+        let best = null;
+        let bestScore = Infinity;
+
+        for (const el of candidates) {
+            const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+            const text = (el.textContent || '').toLowerCase();
+            const combined = `${aria} ${text}`;
+
+            if (!keywords.some(k => combined.includes(k))) continue;
+            // Avoid picking random icon buttons (emoji/gif/attach)
+            if (combined.includes('emoji') || combined.includes('gif') || combined.includes('sticker') || combined.includes('ảnh') || combined.includes('file')) continue;
+
+            const rect = el.getBoundingClientRect();
+            const near =
+                Math.abs(rect.top - cRect.top) < 250 ||
+                (rect.top > cRect.top - 50 && rect.top < cRect.bottom + 250);
+            if (!near) continue;
+
+            const s = distanceScore(cRect, rect);
+            if (s < bestScore) {
+                best = el;
+                bestScore = s;
             }
-            
-            // If no article was processed, resolve false
-        if (!found) {
-                sendLog('⚠️ Không tìm thấy bài viết nào để comment. Có thể cần scroll xuống để xem thêm bài viết.', 'warning');
+        }
+        return best;
+    };
+
+    const submitByEnterFallback = (composer) => {
+        try {
+            composer.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+            composer.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+            return true;
+        } catch (_) {
+            return false;
+        }
+    };
+
+    const commentOne = async (article, text) => {
+        const articleId = getArticleId(article);
+        if (processedPosts.has(articleId + '_comment')) return false;
+
+        // Try open comment area
+        const commentBtn = findCommentButtonNear(article);
+        if (commentBtn) {
+            try { commentBtn.click(); } catch (_) {}
+            await sleep(700);
+        }
+
+        let composer = findComposerForArticle(article);
+        if (!composer) {
+            // Try clicking any “Viết bình luận/Write a comment” hint inside article
+            const hint = Array.from(article.querySelectorAll('span, div, a'))
+                .find(el => el.offsetParent !== null && /viết bình luận|write a comment|add a comment|bình luận|comment/i.test(el.textContent || ''));
+            if (hint) {
+                try { hint.click(); } catch (_) {}
+                await sleep(700);
+                composer = findComposerForArticle(article);
+            }
+        }
+
+        if (!composer) {
+            sendLog('⚠️ Không tìm thấy ô comment cho bài này', 'warning');
+            processedPosts.add(articleId + '_comment'); // avoid getting stuck on same post
+            return false;
+        }
+
+        try {
+            composer.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        } catch (_) {}
+        await sleep(300);
+
+        // Type
+        try {
+            typeInto(composer, text);
+        } catch (e) {
+            sendLog('❌ Lỗi khi nhập comment: ' + e.message, 'error');
+            return false;
+        }
+
+        await sleep(600);
+
+        // Submit
+        const submitBtn = findSubmitButton(composer, article);
+        let submitted = false;
+        if (submitBtn) {
+            try {
+                submitBtn.click();
+                submitted = true;
+            } catch (_) {}
+        }
+        if (!submitted) {
+            submitted = submitByEnterFallback(composer);
+        }
+
+        if (submitted) {
+            processedPosts.add(articleId + '_comment');
+            stats.commentCount++;
+            updateStats();
+            sendLog(`💬 Đã comment: "${preview}" (Tổng: ${stats.commentCount})`, 'success');
+            setTimeout(() => closePopups(true), 500);
+            return true;
+        }
+
+        sendLog('⚠️ Không thể submit comment (không thấy nút Đăng/Gửi)', 'warning');
+        processedPosts.add(articleId + '_comment'); // avoid infinite retry
+        return false;
+    };
+
+    return new Promise(async (resolve) => {
+        try {
+            sendLog(`💬 Đang comment hàng loạt: "${preview}"`, 'info');
+
+            const allArticles = document.querySelectorAll('article, div[role="article"], div[data-pagelet*="FeedUnit"]');
+            const visible = Array.from(allArticles).filter(isElementVisible);
+            if (visible.length === 0) {
+                sendLog('⚠️ Không có bài viết nào visible để comment', 'warning');
                 resolve(false);
+                return;
             }
+
+            const max = Math.min(visible.length, 3);
+            let ok = 0;
+            for (let i = 0; i < max; i++) {
+                const success = await commentOne(visible[i], commentText.trim());
+                if (success) ok++;
+                await sleep(1200);
+            }
+
+            resolve(ok > 0);
         } catch (error) {
             sendLog('❌ Lỗi khi comment: ' + error.message, 'error');
             resolve(false);
@@ -693,7 +660,7 @@ function searchAndAddFriend(keyword) {
 }
 
 // Login to Facebook
-function loginToFacebook(email, password) {
+function loginToFacebook(email, password, forceLogin = false) {
     return new Promise((resolve) => {
         sendLog(`🔐 Đang đăng nhập với: ${email.substring(0, 20)}...`, 'info');
         
@@ -713,161 +680,176 @@ function loginToFacebook(email, password) {
             }
         }
         
-        if (isLoggedIn && !document.querySelector('input[type="email"], input[name="email"]')) {
+        // If already logged in and not forcing login, check if we're on login page
+        if (isLoggedIn && !forceLogin && !document.querySelector('input[type="email"], input[name="email"]')) {
             sendLog('✅ Đã đăng nhập sẵn', 'success');
             resolve(true);
             return;
         }
         
-        // Find email input
-        const emailSelectors = [
-            'input[type="email"]',
-            'input[name="email"]',
-            'input[id*="email"]',
-            'input[placeholder*="Email"]',
-            'input[placeholder*="Phone"]'
-        ];
-        
-        // Find password input
-        const passwordSelectors = [
-            'input[type="password"]',
-            'input[name="pass"]',
-            'input[id*="pass"]'
-        ];
-        
-        // Find login button
-        const loginButtonSelectors = [
-            'button[type="submit"]',
-            'button[name="login"]',
-            'input[type="submit"]',
-            'button[value*="Log"]'
-        ];
-        
-        let emailInput = null;
-        let passwordInput = null;
-        let loginButton = null;
-        
-        // Find email input
-        for (const selector of emailSelectors) {
-            emailInput = document.querySelector(selector);
-            if (emailInput && emailInput.offsetParent !== null) break;
-        }
-        
-        // Find password input
-        for (const selector of passwordSelectors) {
-            passwordInput = document.querySelector(selector);
-            if (passwordInput && passwordInput.offsetParent !== null) break;
-        }
-        
-        // Find login button - try selectors first
-        for (const selector of loginButtonSelectors) {
-            const buttons = document.querySelectorAll(selector);
-            for (const btn of buttons) {
-                if (btn.offsetParent !== null) {
-                    const text = (btn.textContent || btn.value || btn.getAttribute('aria-label') || '').toLowerCase();
-                    if (text.includes('log') || text.includes('đăng nhập') || selector.includes('submit')) {
-                        loginButton = btn;
-                        break;
+        // Helper function to perform actual login
+        const performLogin = () => {
+            // Find email input
+            const emailSelectors = [
+                'input[type="email"]',
+                'input[name="email"]',
+                'input[id*="email"]',
+                'input[placeholder*="Email"]',
+                'input[placeholder*="Phone"]'
+            ];
+            
+            // Find password input
+            const passwordSelectors = [
+                'input[type="password"]',
+                'input[name="pass"]',
+                'input[id*="pass"]'
+            ];
+            
+            // Find login button
+            const loginButtonSelectors = [
+                'button[type="submit"]',
+                'button[name="login"]',
+                'input[type="submit"]',
+                'button[value*="Log"]'
+            ];
+            
+            let emailInput = null;
+            let passwordInput = null;
+            let loginButton = null;
+            
+            // Find email input
+            for (const selector of emailSelectors) {
+                emailInput = document.querySelector(selector);
+                if (emailInput && emailInput.offsetParent !== null) break;
+            }
+            
+            // Find password input
+            for (const selector of passwordSelectors) {
+                passwordInput = document.querySelector(selector);
+                if (passwordInput && passwordInput.offsetParent !== null) break;
+            }
+            
+            // Find login button - try selectors first
+            for (const selector of loginButtonSelectors) {
+                const buttons = document.querySelectorAll(selector);
+                for (const btn of buttons) {
+                    if (btn.offsetParent !== null) {
+                        const text = (btn.textContent || btn.value || btn.getAttribute('aria-label') || '').toLowerCase();
+                        if (text.includes('log') || text.includes('đăng nhập') || selector.includes('submit')) {
+                            loginButton = btn;
+                            break;
+                        }
                     }
                 }
+                if (loginButton) break;
             }
-            if (loginButton) break;
-        }
-        
-        // Fallback: find any submit button near the form
-        if (!loginButton && emailInput && passwordInput) {
-            const form = emailInput.closest('form') || passwordInput.closest('form');
-            if (form) {
-                loginButton = form.querySelector('button[type="submit"], input[type="submit"]');
-            }
-        }
-        
-        if (!emailInput || !passwordInput) {
-            sendLog('❌ Không tìm thấy form đăng nhập', 'error');
-            resolve(false);
-            return;
-        }
-        
-        try {
-            // Fill email
-            emailInput.focus();
-            emailInput.value = email;
-            emailInput.dispatchEvent(new Event('input', { bubbles: true }));
-            emailInput.dispatchEvent(new Event('change', { bubbles: true }));
             
-            // Wait a bit
-            setTimeout(() => {
-                // Fill password
-                passwordInput.focus();
-                passwordInput.value = password;
-                passwordInput.dispatchEvent(new Event('input', { bubbles: true }));
-                passwordInput.dispatchEvent(new Event('change', { bubbles: true }));
+            // Fallback: find any submit button near the form
+            if (!loginButton && emailInput && passwordInput) {
+                const form = emailInput.closest('form') || passwordInput.closest('form');
+                if (form) {
+                    loginButton = form.querySelector('button[type="submit"], input[type="submit"]');
+                }
+            }
+            
+            if (!emailInput || !passwordInput) {
+                sendLog('❌ Không tìm thấy form đăng nhập', 'error');
+                resolve(false);
+                return;
+            }
+            
+            try {
+                // Fill email
+                emailInput.focus();
+                emailInput.value = email;
+                emailInput.dispatchEvent(new Event('input', { bubbles: true }));
+                emailInput.dispatchEvent(new Event('change', { bubbles: true }));
                 
-                // Wait and click login
+                // Wait a bit
                 setTimeout(() => {
-                    if (loginButton) {
-                        loginButton.click();
-                        sendLog('⏳ Đang xử lý đăng nhập...', 'info');
-                        
-                        // Wait for login to complete
-                        setTimeout(() => {
-                            // Check if login successful
-                            let checkCount = 0;
-                            const maxChecks = 15; // 15 seconds max
-                            const checkLogin = setInterval(() => {
-                                checkCount++;
-                                let loggedIn = false;
-                                
-                                // Check for logged in indicators
-                                for (const selector of loggedInIndicators) {
-                                    const element = document.querySelector(selector);
-                                    if (element && !document.querySelector('input[type="email"], input[name="email"]')) {
-                                        loggedIn = true;
-                                        break;
+                    // Fill password
+                    passwordInput.focus();
+                    passwordInput.value = password;
+                    passwordInput.dispatchEvent(new Event('input', { bubbles: true }));
+                    passwordInput.dispatchEvent(new Event('change', { bubbles: true }));
+                    
+                    // Wait and click login
+                    setTimeout(() => {
+                        if (loginButton) {
+                            loginButton.click();
+                            sendLog('⏳ Đang xử lý đăng nhập...', 'info');
+                            
+                            // Wait for login to complete
+                            setTimeout(() => {
+                                // Check if login successful
+                                let checkCount = 0;
+                                const maxChecks = 15; // 15 seconds max
+                                const checkLogin = setInterval(() => {
+                                    checkCount++;
+                                    let loggedIn = false;
+                                    
+                                    // Check for logged in indicators
+                                    for (const selector of loggedInIndicators) {
+                                        const element = document.querySelector(selector);
+                                        if (element && !document.querySelector('input[type="email"], input[name="email"]')) {
+                                            loggedIn = true;
+                                            break;
+                                        }
                                     }
-                                }
-                                
-                                // Check for error messages
-                                const errorElements = document.querySelectorAll('div[role="alert"], .error, [data-testid*="error"], div[id*="error"]');
-                                let hasError = false;
-                                for (const err of errorElements) {
-                                    const text = (err.textContent || '').toLowerCase();
-                                    if (text.includes('incorrect') || text.includes('wrong') || text.includes('sai') || text.includes('không đúng')) {
-                                        hasError = true;
-                                        break;
+                                    
+                                    // Check for error messages
+                                    const errorElements = document.querySelectorAll('div[role="alert"], .error, [data-testid*="error"], div[id*="error"]');
+                                    let hasError = false;
+                                    for (const err of errorElements) {
+                                        const text = (err.textContent || '').toLowerCase();
+                                        if (text.includes('incorrect') || text.includes('wrong') || text.includes('sai') || text.includes('không đúng')) {
+                                            hasError = true;
+                                            break;
+                                        }
                                     }
-                                }
-                                
-                                if (loggedIn) {
-                                    clearInterval(checkLogin);
-                                    sendLog(`✅ Đăng nhập thành công: ${email}`, 'success');
-                                    chrome.runtime.sendMessage({
-                                        type: 'currentAccount',
-                                        account: email
-                                    }).catch(() => {});
-                                    resolve(true);
-                                } else if (hasError || checkCount >= maxChecks) {
-                                    clearInterval(checkLogin);
-                                    if (hasError) {
-                                        sendLog('❌ Đăng nhập thất bại: Sai email hoặc password', 'error');
-                                    } else {
-                                        sendLog('⚠️ Timeout đăng nhập', 'warning');
+                                    
+                                    if (loggedIn) {
+                                        clearInterval(checkLogin);
+                                        sendLog(`✅ Đăng nhập thành công: ${email}`, 'success');
+                                        chrome.runtime.sendMessage({
+                                            type: 'currentAccount',
+                                            account: email
+                                        }).catch(() => {});
+                                        resolve(true);
+                                    } else if (hasError || checkCount >= maxChecks) {
+                                        clearInterval(checkLogin);
+                                        if (hasError) {
+                                            sendLog('❌ Đăng nhập thất bại: Sai email hoặc password', 'error');
+                                        } else {
+                                            sendLog('⚠️ Timeout đăng nhập', 'warning');
+                                        }
+                                        resolve(false);
                                     }
-                                    resolve(false);
-                                }
-                            }, 1000);
-                        }, 2000);
-                    } else {
-                        // Try Enter key
-                        passwordInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
-                        sendLog('⏳ Đang xử lý đăng nhập...', 'info');
-                        setTimeout(() => resolve(true), 3000);
-                    }
+                                }, 1000);
+                            }, 2000);
+                        } else {
+                            // Try Enter key
+                            passwordInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+                            sendLog('⏳ Đang xử lý đăng nhập...', 'info');
+                            setTimeout(() => resolve(true), 3000);
+                        }
+                    }, 500);
                 }, 500);
-            }, 500);
-        } catch (error) {
-            sendLog('❌ Lỗi khi đăng nhập: ' + error.message, 'error');
-            resolve(false);
+            } catch (error) {
+                sendLog('❌ Lỗi khi đăng nhập: ' + error.message, 'error');
+                resolve(false);
+            }
+        };
+        
+        // If forcing login and already logged in, navigate to login page first
+        if (forceLogin && isLoggedIn) {
+            sendLog('🔄 Đang chuyển đến trang đăng nhập để đăng nhập tài khoản mới...', 'info');
+            chrome.runtime.sendMessage({ type: 'navigate', url: 'https://www.facebook.com/login' });
+            // Wait for page to load, then perform login
+            setTimeout(performLogin, 3000);
+        } else {
+            // Call immediately
+            performLogin();
         }
     });
 }
@@ -877,41 +859,112 @@ function logoutFromFacebook() {
     return new Promise((resolve) => {
         sendLog('🚪 Đang đăng xuất...', 'info');
         
-        // Try to find logout button/menu
-        const logoutSelectors = [
+        // Method 1: Try to find and click logout button in account menu
+        const accountMenuSelectors = [
             'div[aria-label*="Account"]',
             'div[aria-label*="Menu"]',
             'div[role="button"][aria-label*="Account"]',
-            'div[aria-label*="Your profile"]'
+            'div[aria-label*="Your profile"]',
+            'div[aria-label*="Profile"]',
+            'div[role="button"][aria-label*="Menu"]',
+            'div[data-testid*="account"]',
+            'div[data-testid*="menu"]'
         ];
         
-        // First, try to open account menu
-        for (const selector of logoutSelectors) {
+        let menuOpened = false;
+        
+        // Try to open account menu
+        for (const selector of accountMenuSelectors) {
             const menuBtn = document.querySelector(selector);
             if (menuBtn && menuBtn.offsetParent !== null) {
-                menuBtn.click();
-                setTimeout(() => {
-                    // Look for logout link
-                    const allLinks = document.querySelectorAll('a[href*="logout"], span, div[role="menuitem"]');
-                    for (const link of allLinks) {
-                        const text = (link.textContent || link.getAttribute('aria-label') || '').toLowerCase();
-                        if ((text.includes('log out') || text.includes('đăng xuất')) && link.offsetParent !== null) {
-                            link.click();
-                            setTimeout(() => resolve(true), 2000);
-                            return;
-                        }
-                    }
-                    // If can't find, just navigate to login page
-                    chrome.runtime.sendMessage({ type: 'navigate', url: 'https://www.facebook.com/login' });
-                    setTimeout(() => resolve(true), 2000);
-                }, 1000);
-                return;
+                try {
+                    menuBtn.click();
+                    menuOpened = true;
+                    sendLog('🔍 Đã mở menu tài khoản, đang tìm nút đăng xuất...', 'info');
+                    break;
+                } catch (e) {
+                    continue;
+                }
             }
         }
         
-        // Fallback: navigate to login page
-        chrome.runtime.sendMessage({ type: 'navigate', url: 'https://www.facebook.com/login' });
-        setTimeout(() => resolve(true), 2000);
+        // Wait for menu to open, then look for logout
+        setTimeout(() => {
+            let logoutFound = false;
+            
+            // Look for logout link/button with various selectors
+            const logoutTexts = ['log out', 'đăng xuất', 'logout', 'sign out', 'đăng xuất khỏi'];
+            const allClickableElements = document.querySelectorAll('a, span, div[role="button"], div[role="menuitem"], div[role="link"], button');
+            
+            for (const element of allClickableElements) {
+                if (element.offsetParent === null) continue;
+                
+                const text = (element.textContent || element.getAttribute('aria-label') || '').toLowerCase();
+                const href = element.getAttribute('href') || '';
+                
+                // Check if it's a logout element
+                const isLogout = logoutTexts.some(logoutText => text.includes(logoutText)) || 
+                                href.includes('logout') || 
+                                href.includes('logout.php');
+                
+                if (isLogout) {
+                    try {
+                        sendLog('✅ Tìm thấy nút đăng xuất, đang click...', 'info');
+                        element.click();
+                        logoutFound = true;
+                        
+                        // Wait for logout to complete
+                        setTimeout(() => {
+                            // Verify logout by checking if we're on login page or login form is visible
+                            const loginFormVisible = document.querySelector('input[type="email"], input[name="email"]');
+                            if (loginFormVisible || window.location.href.includes('login')) {
+                                sendLog('✅ Đã đăng xuất thành công', 'success');
+                                resolve(true);
+                            } else {
+                                // Force navigate to login page
+                                sendLog('⚠️ Chưa thấy form đăng nhập, đang chuyển đến trang login...', 'warning');
+                                chrome.runtime.sendMessage({ type: 'navigate', url: 'https://www.facebook.com/login' });
+                                setTimeout(() => resolve(true), 3000);
+                            }
+                        }, 3000);
+                        return;
+                    } catch (e) {
+                        continue;
+                    }
+                }
+            }
+            
+            // If logout button not found, try direct logout URL
+            if (!logoutFound) {
+                sendLog('⚠️ Không tìm thấy nút đăng xuất, thử dùng URL logout...', 'warning');
+                // Use Facebook's logout URL
+                chrome.runtime.sendMessage({ type: 'navigate', url: 'https://www.facebook.com/logout.php' });
+                
+                // Wait and verify
+                setTimeout(() => {
+                    chrome.runtime.sendMessage({ type: 'navigate', url: 'https://www.facebook.com/login' });
+                    setTimeout(() => {
+                        const loginFormVisible = document.querySelector('input[type="email"], input[name="email"]');
+                        if (loginFormVisible) {
+                            sendLog('✅ Đã đăng xuất thành công (qua URL)', 'success');
+                            resolve(true);
+                        } else {
+                            sendLog('⚠️ Đã chuyển đến trang login (có thể vẫn đang đăng nhập)', 'warning');
+                            // Still resolve to continue, login function will handle it
+                            resolve(true);
+                        }
+                    }, 2000);
+                }, 2000);
+            } else if (!menuOpened) {
+                // If menu wasn't opened and logout not found, try direct URL
+                sendLog('⚠️ Không thể mở menu, thử dùng URL logout...', 'warning');
+                chrome.runtime.sendMessage({ type: 'navigate', url: 'https://www.facebook.com/logout.php' });
+                setTimeout(() => {
+                    chrome.runtime.sendMessage({ type: 'navigate', url: 'https://www.facebook.com/login' });
+                    setTimeout(() => resolve(true), 2000);
+                }, 2000);
+            }
+        }, menuOpened ? 1500 : 500);
     });
 }
 
@@ -993,10 +1046,13 @@ let isSwitchingAccount = false;
 let switchRetryCount = 0;
 let totalAccountCycles = 0; // Track how many times we've gone through all accounts
 
-async function switchToNextAccount(settings) {
+async function switchToNextAccount(settings, skipIndexIncrement = false) {
     if (!settings.multiAccount || accounts.length === 0 || isSwitchingAccount) return;
     
     isSwitchingAccount = true;
+    
+    // Stop popup watcher during account switch to prevent interference
+    stopPopupWatcher();
     
     // Clear automation timeout
     if (automationTimeout) {
@@ -1006,8 +1062,10 @@ async function switchToNextAccount(settings) {
     
     try {
         // Check if we've completed one full cycle
-        const nextIndex = currentAccountIndex + 1;
-        if (nextIndex >= accounts.length) {
+        // If skipIndexIncrement is true, we're retrying after a failed login, so don't increment
+        if (!skipIndexIncrement) {
+            const nextIndex = currentAccountIndex + 1;
+            if (nextIndex >= accounts.length) {
             // Completed one full cycle
             totalAccountCycles++;
             
@@ -1025,9 +1083,23 @@ async function switchToNextAccount(settings) {
         } else {
             currentAccountIndex = nextIndex;
         }
+        } // End of !skipIndexIncrement block
+        
+        // If skipIndexIncrement is true, check if we need to loop back
+        if (skipIndexIncrement && currentAccountIndex >= accounts.length) {
+            if (settings.loopAccounts) {
+                currentAccountIndex = 0;
+                totalAccountCycles++;
+                sendLog(`🔄 Đã hết accounts, quay lại từ đầu (Lượt ${totalAccountCycles + 1})`, 'info');
+            } else {
+                sendLog(`✅ Đã chạy xong tất cả accounts. Dừng automation.`, 'success');
+                isSwitchingAccount = false;
+                stopAutomation();
+                return;
+            }
+        }
         
         const account = accounts[currentAccountIndex];
-        switchRetryCount = 0; // Reset retry count on successful switch
         
         sendLog(`🔄 Chuyển sang account ${currentAccountIndex + 1}/${accounts.length}: ${account.email}`, 'info');
         
@@ -1043,20 +1115,42 @@ async function switchToNextAccount(settings) {
         stats.commentCount = 0;
         stats.friendCount = 0;
         actionCount = 0;
+        processedPosts.clear(); // Clear processed posts for new account
         updateStats();
         
         // Logout current account
         await logoutFromFacebook();
         
-        // Wait for page to load
+        // Wait for page to load and ensure we're logged out
         await new Promise(resolve => setTimeout(resolve, 3000));
         
-        // Login with new account
-        const loginSuccess = await loginToFacebook(account.email, account.password);
+        // Verify we're on login page
+        const loginFormVisible = document.querySelector('input[type="email"], input[name="email"]');
+        if (!loginFormVisible) {
+            // Force navigate to login page if not already there
+            sendLog('🔄 Đang chuyển đến trang đăng nhập...', 'info');
+            chrome.runtime.sendMessage({ type: 'navigate', url: 'https://www.facebook.com/login' });
+            await new Promise(resolve => setTimeout(resolve, 3000));
+        }
+        
+        // Login with new account (force login to ensure we login with the new account)
+        const loginSuccess = await loginToFacebook(account.email, account.password, true);
         
         if (loginSuccess) {
             accountStartTime = Date.now();
+            switchRetryCount = 0; // Reset retry count on successful login
             isSwitchingAccount = false;
+            
+            // Update current account display
+            chrome.runtime.sendMessage({
+                type: 'currentAccount',
+                account: account.email
+            }).catch(() => {});
+            
+            // Restart popup watcher
+            if (isRunning) {
+                startPopupWatcher();
+            }
             // Restart automation
             if (isRunning) {
                 await new Promise(resolve => setTimeout(resolve, 2000));
@@ -1064,21 +1158,38 @@ async function switchToNextAccount(settings) {
             }
         } else {
             switchRetryCount++;
-            const maxRetries = accounts.length;
+            const maxRetries = accounts.length * 2; // Allow retrying through all accounts twice
             
             if (switchRetryCount < maxRetries) {
-                sendLog(`⚠️ Không thể đăng nhập (${switchRetryCount}/${maxRetries}), thử account tiếp theo...`, 'warning');
+                sendLog(`⚠️ Không thể đăng nhập với ${account.email} (${switchRetryCount}/${maxRetries}), thử account tiếp theo...`, 'warning');
                 isSwitchingAccount = false;
-                setTimeout(() => switchToNextAccount(settings), 5000);
+                // Restart popup watcher
+                if (isRunning) {
+                    startPopupWatcher();
+                }
+                // Increment index to skip the failed account, then call switchToNextAccount with skip flag
+                setTimeout(() => {
+                    currentAccountIndex = (currentAccountIndex + 1) % accounts.length;
+                    // Pass skipIndexIncrement=true to prevent double increment
+                    switchToNextAccount(settings, true);
+                }, 5000);
             } else {
-                sendLog('❌ Đã thử tất cả accounts, dừng automation', 'error');
+                sendLog('❌ Đã thử tất cả accounts nhiều lần, dừng automation', 'error');
                 isSwitchingAccount = false;
+                // Restart popup watcher before stopping
+                if (isRunning) {
+                    startPopupWatcher();
+                }
                 stopAutomation();
             }
         }
     } catch (error) {
         sendLog('❌ Lỗi khi chuyển account: ' + error.message, 'error');
         isSwitchingAccount = false;
+        // Restart popup watcher on error
+        if (isRunning) {
+            startPopupWatcher();
+        }
     }
 }
 
@@ -1161,18 +1272,29 @@ async function runAutomation(settings) {
         
         // Auto like hàng loạt
         if (settings.autoLike) {
-            const liked = likePost();
+            const likeResult = likePost();
+            // Handle both old boolean return and new object return for backward compatibility
+            const liked = typeof likeResult === 'object' ? likeResult.liked : likeResult;
+            const hasMore = typeof likeResult === 'object' ? likeResult.hasMore : false;
+            
             if (liked) {
                 hasAction = true;
                 actionCount++;
                 await new Promise(resolve => setTimeout(resolve, randomDelay(settings.speed * 800, (settings.speed + 1) * 1000)));
                 // Close popup again after delay
                 closePopups();
+                
+                // Nếu đã like hết bài visible, tự động scroll để tìm bài mới
+                if (!hasMore && settings.autoScroll) {
+                    sendLog('📜 Đã like hết bài visible, đang scroll để tìm bài mới...', 'info');
+                    scrollPage();
+                    await new Promise(resolve => setTimeout(resolve, settings.speed * 1000));
+                }
             } else {
                 // Nếu không tìm thấy bài để like, scroll xuống để load thêm
                 if (settings.autoScroll) {
                     scrollPage();
-                await new Promise(resolve => setTimeout(resolve, 1000));
+                    await new Promise(resolve => setTimeout(resolve, 1000));
                 }
             }
         }
@@ -1304,25 +1426,33 @@ async function startAutomation(settings) {
                 }
             }
             
+            // Always start with the first account in the list to avoid index mismatch.
+            // If user is already logged in with some other account, we must logout first.
+            currentAccountIndex = 0;
+            const firstAccount = accounts[0];
+            
             if (alreadyLoggedIn) {
-                sendLog('✅ Đã đăng nhập sẵn, bắt đầu với account hiện tại', 'info');
-                currentAccountIndex = 0; // Assume using first account
-                accountStartTime = Date.now();
-            } else {
-                // Login with first account (index 0)
-                currentAccountIndex = 0;
-                const firstAccount = accounts[0];
-                sendLog(`🔐 Đăng nhập với account đầu tiên: ${firstAccount.email}`, 'info');
-                const loginSuccess = await loginToFacebook(firstAccount.email, firstAccount.password);
-                
-                if (!loginSuccess) {
-                    sendLog('❌ Không thể đăng nhập với account đầu tiên', 'error');
-                    stopAutomation();
-                    return;
-                }
-                
-                accountStartTime = Date.now();
+                sendLog('🔄 Đang đăng xuất để đăng nhập đúng account đầu tiên...', 'info');
+                await logoutFromFacebook();
+                await new Promise(resolve => setTimeout(resolve, 3000));
             }
+            
+            // Ensure we're on login page before trying to login
+            if (!document.querySelector('input[type="email"], input[name="email"]')) {
+                chrome.runtime.sendMessage({ type: 'navigate', url: 'https://www.facebook.com/login' }).catch(() => {});
+                await new Promise(resolve => setTimeout(resolve, 3000));
+            }
+            
+            sendLog(`🔐 Đăng nhập với account đầu tiên: ${firstAccount.email}`, 'info');
+            const loginSuccess = await loginToFacebook(firstAccount.email, firstAccount.password, true);
+            
+            if (!loginSuccess) {
+                sendLog('❌ Không thể đăng nhập với account đầu tiên', 'error');
+                stopAutomation();
+                return;
+            }
+            
+            accountStartTime = Date.now();
             
             sendLog(`⏰ Sẽ chuyển account sau ${settings.switchTime} phút`, 'info');
         } else {
