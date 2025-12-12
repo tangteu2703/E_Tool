@@ -1410,6 +1410,18 @@ async function startAutomation(settings) {
         accounts = parseAccounts(settings.accountList);
         if (accounts.length > 0) {
             sendLog(`📋 Đã tải ${accounts.length} tài khoản`, 'info');
+
+            const withTimeout = async (promise, ms, label) => {
+                let timeoutId = null;
+                const timeoutPromise = new Promise((_, reject) => {
+                    timeoutId = setTimeout(() => reject(new Error(`Timeout: ${label} (${ms}ms)`)), ms);
+                });
+                try {
+                    return await Promise.race([promise, timeoutPromise]);
+                } finally {
+                    if (timeoutId) clearTimeout(timeoutId);
+                }
+            };
             
             // Check if already logged in
             const loggedInIndicators = [
@@ -1425,6 +1437,8 @@ async function startAutomation(settings) {
                     break;
                 }
             }
+
+            sendLog(`🧭 Trạng thái hiện tại: ${alreadyLoggedIn ? 'Đã đăng nhập' : 'Chưa đăng nhập / đang ở trang login'}`, 'info');
             
             // Always start with the first account in the list to avoid index mismatch.
             // If user is already logged in with some other account, we must logout first.
@@ -1433,21 +1447,36 @@ async function startAutomation(settings) {
             
             if (alreadyLoggedIn) {
                 sendLog('🔄 Đang đăng xuất để đăng nhập đúng account đầu tiên...', 'info');
-                await logoutFromFacebook();
+                try {
+                    await withTimeout(logoutFromFacebook(), 20000, 'logout');
+                } catch (e) {
+                    sendLog(`⚠️ Logout bị chậm/treo: ${e.message}. Thử chuyển thẳng tới trang login...`, 'warning');
+                }
                 await new Promise(resolve => setTimeout(resolve, 3000));
             }
             
             // Ensure we're on login page before trying to login
             if (!document.querySelector('input[type="email"], input[name="email"]')) {
+                sendLog('➡️ Chuyển tới trang đăng nhập...', 'info');
                 chrome.runtime.sendMessage({ type: 'navigate', url: 'https://www.facebook.com/login' }).catch(() => {});
                 await new Promise(resolve => setTimeout(resolve, 3000));
             }
             
             sendLog(`🔐 Đăng nhập với account đầu tiên: ${firstAccount.email}`, 'info');
-            const loginSuccess = await loginToFacebook(firstAccount.email, firstAccount.password, true);
+            let loginSuccess = false;
+            try {
+                loginSuccess = await withTimeout(
+                    loginToFacebook(firstAccount.email, firstAccount.password, true),
+                    45000,
+                    'login'
+                );
+            } catch (e) {
+                sendLog(`⚠️ Login bị chậm/treo: ${e.message}`, 'warning');
+                loginSuccess = false;
+            }
             
             if (!loginSuccess) {
-                sendLog('❌ Không thể đăng nhập với account đầu tiên', 'error');
+                sendLog('❌ Không thể đăng nhập với account đầu tiên (có thể FB checkpoint/2FA/verify).', 'error');
                 stopAutomation();
                 return;
             }
